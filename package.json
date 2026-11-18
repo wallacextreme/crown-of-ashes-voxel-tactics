@@ -1,0 +1,20 @@
+{
+  "name": "crown-of-ashes-voxel-tactics",
+  "version": "1.0.0",
+  "description": "CROWN OF ASHES: VOXEL TACTICS — Tactical JRPG in HD-3D Voxel Diorama with Three.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/tactics.test.mjs"
+  },
+  "dependencies": {
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.187.0",
+    "typescript": "^5.8.2",
+    "vite": "^7.3.1"
+  }
+}
