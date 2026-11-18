@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#d4a348" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+    <title>CROWN OF ASHES: VOXEL TACTICS</title>
+    <script type="module" crossorigin src="./assets/index-CZB06ShB.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DwLtKZTr.css">
+  </head>
+  <body>
+    <canvas id="game-canvas"></canvas>
+
+    <!-- 3D Projected Unit Bars & JRPG Damage Numbers -->
+    <div id="floating-layer" aria-hidden="true"></div>
+
+    <!-- RESTORE FULL HUD FLOATING PILL (shown when user hides HUD) -->
+    <button id="btn-restore-hud" class="hud-btn hud-btn-gold restore-hud-btn hidden" title="Reabrir HUD">
+      👁️ Mostrar HUD
+    </button>
+
+    <!-- OPEN TARGET INSPECTOR FLOATING PILL (shown when user closes target panel) -->
+    <button id="btn-open-target" class="hud-btn open-target-pill hidden" title="Abrir Inspetor de Alvo/Tile">
+      🎯 Inspetor
+    </button>
+
+    <!-- TOP HUD: Stage, CTB Timeline (10 Turns), Controls -->
+    <header id="top-hud">
+      <div class="hud-stage-box">
+        <div class="stage-kicker" id="hud-stage-kicker">ATO I • FASE 1</div>
+        <div class="stage-title" id="hud-stage-title">Ruínas da Abadia de Orbonne</div>
+        <div class="stage-meta">
+          <span id="hud-turn-badge">Turno 1</span>
+          <span>•</span>
+          <span id="hud-gold-badge">🪙 460</span>
+        </div>
+      </div>
+
+      <div class="ctb-panel" aria-label="Linha do Tempo de Turnos CTB">
+        <div class="ctb-label">ORDEM DE TURNOS (CTB)</div>
+        <div id="ctb-timeline" class="ctb-list"></div>
+      </div>
+
+      <div class="hud-actions">
+        <button id="btn-rot-left" class="hud-btn" title="Girar câmera 90° esquerda (Q)">⟲ 90° [Q]</button>
+        <button id="btn-rot-right" class="hud-btn" title="Girar câmera 90° direita (E)">⟳ 90° [E]</button>
+        <button id="btn-speed" class="hud-btn" title="Alternar velocidade de animação">⚡ 1x</button>
+        <button id="btn-graphics" class="hud-btn" title="Alternar preset gráfico (LOW / MEDIUM / HIGH)">⚙️ GRÁFICOS: HIGH</button>
+        <button id="btn-mute" class="hud-btn" title="Ligar/Desligar Áudio">🔊</button>
+        <button id="btn-toggle-hud" class="hud-btn" title="Ocultar/Mostrar HUD">👁️ HUD</button>
+        <button id="btn-open-barracks" class="hud-btn hud-btn-gold">🏰 QUARTEL &amp; MAPA</button>
+      </div>
+    </header>
+
+    <!-- DRAMATIC CAST BANNER -->
+    <div id="cast-banner" class="cast-banner hidden" role="status"></div>
+
+    <!-- BOTTOM LEFT: Active Hero & FFT Command Menu -->
+    <section id="active-hero-panel" class="bottom-panel left-panel">
+      <div class="panel-top-row">
+        <div class="unit-header">
+          <div id="active-avatar" class="unit-avatar">⚔️</div>
+          <div class="unit-titles">
+            <div class="unit-name-row">
+              <span id="active-name" class="unit-name">Ramza</span>
+              <span id="active-lvl" class="unit-lvl">Nv. 1</span>
+            </div>
+            <div id="active-job" class="unit-job">Cavaleiro Sagrado</div>
+            <div id="active-statuses" class="status-pills"></div>
+          </div>
+        </div>
+        <button id="btn-collapse-hero" class="mini-close-btn" title="Minimizar/Expandir painel do herói">▾</button>
+      </div>
+
+      <div id="active-hero-body">
+        <div class="bars-grid">
+          <div class="bar-row">
+            <span class="bar-label">HP</span>
+            <div class="bar-track"><div id="active-hp-fill" class="bar-fill hp-fill"></div></div>
+            <span id="active-hp-text" class="bar-num">260/260</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">MP</span>
+            <div class="bar-track"><div id="active-mp-fill" class="bar-fill mp-fill"></div></div>
+            <span id="active-mp-text" class="bar-num">65/65</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">CT</span>
+            <div class="bar-track"><div id="active-ct-fill" class="bar-fill ct-fill"></div></div>
+            <span id="active-ct-text" class="bar-num">100</span>
+          </div>
+        </div>
+
+        <div id="active-equip-line" class="equip-summary"></div>
+
+        <div id="command-menu" class="command-menu">
+          <button id="cmd-move" class="cmd-btn"><span>🥾 MOVER</span><small>Alcance azul</small></button>
+          <button id="cmd-attack" class="cmd-btn"><span>⚔️ ATACAR</span><small>Golpe básico</small></button>
+          <button id="cmd-skills" class="cmd-btn"><span>✨ HABILIDADES</span><small>Classe &amp; Magia</small></button>
+          <button id="cmd-wait" class="cmd-btn"><span>🧭 ESPERAR / DIREÇÃO</span><small id="wait-ct-hint">+40 CT</small></button>
+        </div>
+
+        <div id="skills-submenu" class="skills-submenu hidden">
+          <div class="submenu-header">
+            <span>Habilidades de Classe</span>
+            <button id="btn-close-skills" class="mini-close-btn" title="Fechar habilidades">✖</button>
+          </div>
+          <div id="skills-list" class="skills-list"></div>
+        </div>
+
+        <div id="facing-submenu" class="facing-submenu hidden">
+          <div class="submenu-header">
+            <span class="facing-title">Direção do Olhar (Setas 3D ou abaixo)</span>
+            <button id="btn-close-facing" class="mini-close-btn" title="Fechar direção">✖</button>
+          </div>
+          <div class="facing-grid">
+            <button class="face-btn" data-facing="N">⬆️ NORTE</button>
+            <button class="face-btn" data-facing="S">⬇️ SUL</button>
+            <button class="face-btn" data-facing="W">⬅️ OESTE</button>
+            <button class="face-btn" data-facing="E">➡️ LESTE</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BOTTOM RIGHT: Target Inspector & Combat Forecast -->
+    <section id="target-forecast-panel" class="bottom-panel right-panel">
+      <div id="tile-inspector" class="tile-inspector">
+        <span id="tile-coords">Tile (0, 0)</span>
+        <span id="tile-height-badge" class="height-badge">H: 2</span>
+        <span id="tile-surface-badge" class="surface-badge">Pedra</span>
+        <button id="btn-collapse-target" class="mini-close-btn" title="Fechar inspetor">✖</button>
+      </div>
+
+      <div id="target-unit-box" class="target-unit-box hidden">
+        <div class="unit-header">
+          <div id="target-avatar" class="unit-avatar">💀</div>
+          <div class="unit-titles">
+            <div class="unit-name-row">
+              <span id="target-name" class="unit-name">Inimigo</span>
+              <span id="target-lvl" class="unit-lvl">Nv. 2</span>
+            </div>
+            <div id="target-job" class="unit-job">Cavaleiro Negro</div>
+            <div id="target-facing-text" class="target-facing-text">Olhando: Sul (S)</div>
+          </div>
+        </div>
+        <div class="bars-grid">
+          <div class="bar-row">
+            <span class="bar-label">HP</span>
+            <div class="bar-track"><div id="target-hp-fill" class="bar-fill hp-fill"></div></div>
+            <span id="target-hp-text" class="bar-num">340/340</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">MP</span>
+            <div class="bar-track"><div id="target-mp-fill" class="bar-fill mp-fill"></div></div>
+            <span id="target-mp-text" class="bar-num">90/90</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="forecast-card" class="forecast-card hidden">
+        <div class="forecast-title">PREVISÃO DE COMBATE</div>
+        <div id="forecast-banner" class="forecast-banner"></div>
+        <div id="forecast-sub" class="forecast-sub">Toque para pré-visualizar ou confirme abaixo</div>
+        <button id="btn-confirm-forecast" class="hud-btn hud-btn-primary confirm-forecast-btn">✅ CONFIRMAR AÇÃO</button>
+      </div>
+
+      <div id="controls-hint" class="controls-hint">
+        🖱️/👆 Girar • Scroll/Pinça: Zoom • Q/E: Girar 90°
+      </div>
+    </section>
+
+    <!-- BARRACKS / SHOP / CAMPAIGN MAP MODAL -->
+    <div id="barracks-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-header">
+          <div>
+            <h2>🏰 QUARTEL REAL &amp; ARSENAL TÁTICO</h2>
+            <p class="modal-subtitle">Gerencie seu esquadrão, desbloqueie habilidades com JP, equipe relíquias e escolha a fase da campanha.</p>
+          </div>
+          <div class="modal-header-right">
+            <span id="barracks-gold" class="gold-pill">🪙 460 Ouro</span>
+            <button id="btn-close-barracks" class="hud-btn">✖ Voltar à Batalha</button>
+          </div>
+        </header>
+
+        <nav class="modal-tabs">
+          <button class="tab-btn active" data-tab="campaign">🗺️ Mapa da Campanha (5 Fases)</button>
+          <button class="tab-btn" data-tab="squad">⚔️ Esquadrão &amp; Habilidades (⭐ JP)</button>
+          <button class="tab-btn" data-tab="shop">🏪 Arsenal &amp; Taverna (🪙 Gold)</button>
+        </nav>
+
+        <div id="barracks-body" class="modal-body"></div>
+      </div>
+    </div>
+
+    <!-- VICTORY / DEFEAT RESULT MODAL -->
+    <div id="result-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+      <div class="result-card">
+        <div id="result-kicker" class="result-kicker">MISSÃO CONCLUÍDA</div>
+        <h2 id="result-title">STAGE CLEAR!</h2>
+        <p id="result-desc"></p>
+        <div id="result-rewards" class="result-rewards"></div>
+        <div class="result-actions">
+          <button id="btn-result-barracks" class="hud-btn hud-btn-gold">🏰 Ir ao Quartel</button>
+          <button id="btn-result-replay" class="hud-btn">🔁 Rejogar Fase</button>
+          <button id="btn-result-next" class="hud-btn hud-btn-primary">⚔️ Próxima Fase</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js').catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>
