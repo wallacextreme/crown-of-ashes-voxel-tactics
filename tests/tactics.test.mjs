@@ -287,3 +287,300 @@ test('TacticalAI picks backstab/AoE/Belias Apocalypse Meteor cleanly', () => {
   assert.ok(decision.skill !== null);
   assert.equal(decision.skill?.id, 'apocalypse_meteor');
 });
+
+function createControlledEngine(stageId = 1, rng = () => 0.5) {
+  const stage = structuredClone(getStageDef(stageId));
+  const cm = new CampaignManager(new MemoryStorage());
+  return new TacticalCombatEngine(stage, cm.getDeployedHeroes(), rng);
+}
+
+function clearTileOccupants(engine, col, row, keepIds = []) {
+  let offset = 0;
+  for (const u of engine.units) {
+    if (keepIds.includes(u.id)) continue;
+    if (u.col === col && u.row === row) {
+      // Relocate non-involved units to another walkable tile
+      for (const t of engine.tiles.values()) {
+        if (
+          t.walkable &&
+          (t.col !== col || t.row !== row) &&
+          !engine.getUnitAt(t.col, t.row, true)
+        ) {
+          u.col = t.col;
+          u.row = t.row;
+          break;
+        }
+      }
+      offset++;
+    }
+  }
+  return offset;
+}
+
+function findAdjacentWalkableTile(engine, col, row, excludeIds = []) {
+  const dirs = [
+    { dc: 1, dr: 0 },
+    { dc: -1, dr: 0 },
+    { dc: 0, dr: 1 },
+    { dc: 0, dr: -1 },
+  ];
+  const centerTile = engine.getTile(col, row);
+  for (const d of dirs) {
+    const nc = col + d.dc;
+    const nr = row + d.dr;
+    const t = engine.getTile(nc, nr);
+    if (!t || !t.walkable) continue;
+    if (centerTile && Math.abs(t.height - centerTile.height) > 2) continue;
+    const occ = engine.getUnitAt(nc, nr, true);
+    if (!occ || !excludeIds.includes(occ.id)) {
+      return { col: nc, row: nr };
+    }
+  }
+  return null;
+}
+
+test('Cenário 1 (Mover -> Atacar -> Confirmar Direção): dano, abate e abate do último inimigo sem softlock', () => {
+  // 1A: Move -> Attack (survives) -> SELECT_FACING -> endUnitTurn -> advanceToNextTurn
+  {
+    const engine = createControlledEngine(1, () => 0.5);
+    const turn1 = engine.advanceToNextTurn();
+    const hero = turn1.activeUnit;
+    assert.ok(hero && hero.team === 'ally');
+
+    const moveRange = engine.getMoveRange(hero);
+    const dest = Array.from(moveRange.values()).find(
+      (n) => (n.col !== hero.col || n.row !== hero.row) && findAdjacentWalkableTile(engine, n.col, n.row, [hero.id])
+    );
+    assert.ok(dest, 'Expected at least one reachable destination tile with an adjacent walkable tile');
+
+    const adj = findAdjacentWalkableTile(engine, dest.col, dest.row, [hero.id]);
+    assert.ok(adj);
+    const enemy = engine.units.find((u) => u.team === 'enemy' && u.hp > 0);
+    assert.ok(enemy);
+    clearTileOccupants(engine, adj.col, adj.row, [hero.id, enemy.id]);
+    enemy.col = adj.col;
+    enemy.row = adj.row;
+
+    const ctBeforeAction = hero.ct;
+    const moveRes = engine.moveUnit(hero, dest.col, dest.row);
+    assert.equal(moveRes.moved, true);
+    assert.equal(hero.hasMovedThisTurn, true);
+    assert.equal(hero.ct, ctBeforeAction, 'CT must not be deducted on move');
+
+    const exec = engine.executeAttack(hero, enemy.col, enemy.row);
+    assert.ok(exec);
+    assert.equal(exec.hits.length, 1);
+    assert.ok(exec.hits[0].damage > 0);
+    assert.equal(exec.hits[0].killed, false);
+    assert.equal(hero.hasActedThisTurn, true);
+    assert.equal(hero.ct, ctBeforeAction, 'CT must NEVER be deducted mid-attack before endUnitTurn');
+
+    assert.equal(engine.checkVictoryCondition(), null);
+    assert.equal(engine.getPostActionState(hero), 'SELECT_FACING');
+
+    const newCt = engine.endUnitTurn('E');
+    assert.equal(newCt, 0);
+    assert.equal(hero.ct, 0);
+    assert.equal(hero.facing, 'E');
+    assert.equal(hero.hasMovedThisTurn, false);
+    assert.equal(hero.hasActedThisTurn, false);
+    assert.equal(engine.activeUnitId, null);
+
+    const turn2 = engine.advanceToNextTurn();
+    assert.ok(turn2.activeUnit);
+    assert.notEqual(turn2.activeUnit.id, hero.id);
+    assert.ok(turn2.activeUnit.ct >= 100);
+  }
+
+  // 1B: Move -> Attack (kills non-last enemy) -> SELECT_FACING -> endUnitTurn -> advanceToNextTurn
+  {
+    const engine = createControlledEngine(1, () => 0.5);
+    const hero = engine.advanceToNextTurn().activeUnit;
+    assert.ok(hero && hero.team === 'ally');
+
+    const moveRange = engine.getMoveRange(hero);
+    const dest = Array.from(moveRange.values()).find(
+      (n) => (n.col !== hero.col || n.row !== hero.row) && findAdjacentWalkableTile(engine, n.col, n.row, [hero.id])
+    );
+    assert.ok(dest);
+    const adj = findAdjacentWalkableTile(engine, dest.col, dest.row, [hero.id]);
+    assert.ok(adj);
+
+    const enemies = engine.units.filter((u) => u.team === 'enemy' && u.hp > 0);
+    assert.ok(enemies.length >= 2);
+    const target = enemies[0];
+    clearTileOccupants(engine, adj.col, adj.row, [hero.id, target.id]);
+    target.col = adj.col;
+    target.row = adj.row;
+    target.hp = 1;
+
+    engine.moveUnit(hero, dest.col, dest.row);
+    const exec = engine.executeAttack(hero, target.col, target.row);
+    assert.ok(exec);
+    assert.equal(exec.hits[0].killed, true);
+    assert.equal(target.hp, 0);
+    assert.equal(engine.checkVictoryCondition(), null);
+    assert.equal(engine.getPostActionState(hero), 'SELECT_FACING');
+
+    engine.endUnitTurn('N');
+    assert.equal(hero.facing, 'N');
+    assert.equal(hero.ct, 0);
+
+    const nextTurn = engine.advanceToNextTurn();
+    assert.ok(nextTurn.activeUnit && nextTurn.activeUnit.hp > 0);
+  }
+
+  // 1C: Attack kills the LAST enemy -> immediate VICTORY without waiting for facing selection
+  {
+    const engine = createControlledEngine(1, () => 0.5);
+    const hero = engine.advanceToNextTurn().activeUnit;
+    assert.ok(hero && hero.team === 'ally');
+
+    const adj = findAdjacentWalkableTile(engine, hero.col, hero.row, [hero.id]);
+    assert.ok(adj);
+    const enemies = engine.units.filter((u) => u.team === 'enemy');
+    const lastEnemy = enemies[0];
+    for (const e of enemies) {
+      if (e.id !== lastEnemy.id) e.hp = 0;
+    }
+    clearTileOccupants(engine, adj.col, adj.row, [hero.id, lastEnemy.id]);
+    lastEnemy.col = adj.col;
+    lastEnemy.row = adj.row;
+    lastEnemy.hp = 1;
+
+    const exec = engine.executeAttack(hero, lastEnemy.col, lastEnemy.row);
+    assert.ok(exec);
+    assert.equal(exec.hits[0].killed, true);
+    assert.equal(engine.checkVictoryCondition(), 'victory');
+    assert.equal(engine.combatEnded, 'victory');
+    assert.equal(engine.getPostActionState(hero), 'VICTORY');
+    assert.equal(engine.advanceToNextTurn().activeUnit, null);
+  }
+});
+
+test('Cenário 2 (Atacar -> Mover -> Encerrar Turno): libera movimento após ataque, entra em direção e passa a vez', () => {
+  const engine = createControlledEngine(1, () => 0.5);
+  const hero = engine.advanceToNextTurn().activeUnit;
+  assert.ok(hero && hero.team === 'ally');
+
+  const adj = findAdjacentWalkableTile(engine, hero.col, hero.row, [hero.id]);
+  assert.ok(adj);
+  const enemy = engine.units.find((u) => u.team === 'enemy' && u.hp > 0);
+  assert.ok(enemy);
+  clearTileOccupants(engine, adj.col, adj.row, [hero.id, enemy.id]);
+  enemy.col = adj.col;
+  enemy.row = adj.row;
+
+  const ctBefore = hero.ct;
+  const exec = engine.executeAttack(hero, enemy.col, enemy.row);
+  assert.ok(exec);
+  assert.ok(exec.hits[0].damage > 0);
+  assert.equal(hero.hasActedThisTurn, true);
+  assert.equal(hero.hasMovedThisTurn, false);
+  assert.equal(hero.ct, ctBefore, 'CT must stay intact until endUnitTurn');
+
+  // Case A: Hero acted first, has not moved yet and move > 0 -> CONTINUE_TURN
+  assert.equal(engine.canUnitMove(hero), true);
+  assert.equal(engine.getPostActionState(hero), 'CONTINUE_TURN');
+
+  const moveRange = engine.getMoveRange(hero);
+  const dest = Array.from(moveRange.values()).find((n) => n.col !== hero.col || n.row !== hero.row);
+  assert.ok(dest);
+  const moveRes = engine.moveUnit(hero, dest.col, dest.row);
+  assert.equal(moveRes.moved, true);
+  assert.equal(hero.hasMovedThisTurn, true);
+  assert.equal(hero.ct, ctBefore);
+
+  // Case B: Hero has now both acted and moved -> SELECT_FACING
+  assert.equal(engine.getPostActionState(hero), 'SELECT_FACING');
+
+  const finalCt = engine.endUnitTurn('S');
+  assert.equal(finalCt, 0);
+  assert.equal(hero.ct, 0);
+  assert.equal(hero.facing, 'S');
+  assert.equal(engine.activeUnitId, null);
+
+  const nextTurn = engine.advanceToNextTurn();
+  assert.ok(nextTurn.activeUnit);
+  assert.notEqual(nextTurn.activeUnit.id, hero.id);
+  assert.ok(nextTurn.activeUnit.ct >= 100);
+});
+
+test('Cenário 3 (Habilidade -> Encerrar Turno): magia de classe mantém mover/passar vez e encerra turno sem softlock', () => {
+  // 3A: Mage casts Firaga without moving -> CONTINUE_TURN -> chooses Wait/End Turn (+20 CT) -> advances CTB
+  {
+    const engine = createControlledEngine(1, () => 0.5);
+    const mage = engine.units.find((u) => u.team === 'ally' && u.jobId === 'black_mage');
+    assert.ok(mage);
+    mage.ct = 140;
+
+    const turn = engine.advanceToNextTurn();
+    assert.equal(turn.activeUnit?.id, mage.id);
+
+    const firaga = JOBS.black_mage.skills.find((s) => s.id === 'firaga');
+    assert.ok(firaga);
+    const enemy = engine.units.find((u) => u.team === 'enemy' && u.hp > 0);
+    assert.ok(enemy);
+
+    const adj = findAdjacentWalkableTile(engine, mage.col, mage.row, [mage.id]);
+    assert.ok(adj);
+    clearTileOccupants(engine, adj.col, adj.row, [mage.id, enemy.id]);
+    enemy.col = adj.col;
+    enemy.row = adj.row;
+
+    const mpBefore = mage.mp;
+    const ctBefore = mage.ct;
+    const exec = engine.executeSkill(mage, firaga, enemy.col, enemy.row);
+    assert.equal(mage.mp, mpBefore - firaga.mpCost);
+    assert.equal(mage.hasActedThisTurn, true);
+    assert.equal(mage.hasMovedThisTurn, false);
+    assert.equal(mage.ct, ctBefore);
+    assert.ok(exec.hits.some((h) => h.targetId === enemy.id && h.damage > 0));
+    assert.equal(engine.getPostActionState(mage), 'CONTINUE_TURN');
+
+    const newCt = engine.endUnitTurn('W');
+    assert.equal(newCt, 20);
+    assert.equal(mage.ct, 20);
+    assert.equal(mage.facing, 'W');
+
+    const nextTurn = engine.advanceToNextTurn();
+    assert.ok(nextTurn.activeUnit);
+    assert.notEqual(nextTurn.activeUnit.id, mage.id);
+    assert.ok(nextTurn.activeUnit.ct >= 100);
+  }
+
+  // 3B: Immobilized unit (or move === 0) casts skill -> straight to SELECT_FACING -> endUnitTurn -> advances CTB
+  {
+    const engine = createControlledEngine(1, () => 0.5);
+    const mage = engine.units.find((u) => u.team === 'ally' && u.jobId === 'black_mage');
+    assert.ok(mage);
+    mage.ct = 140;
+    mage.move = 0;
+
+    const turn = engine.advanceToNextTurn();
+    assert.equal(turn.activeUnit?.id, mage.id);
+
+    const firaga = JOBS.black_mage.skills.find((s) => s.id === 'firaga');
+    assert.ok(firaga);
+    const enemy = engine.units.find((u) => u.team === 'enemy' && u.hp > 0);
+    assert.ok(enemy);
+
+    const adj = findAdjacentWalkableTile(engine, mage.col, mage.row, [mage.id]);
+    assert.ok(adj);
+    clearTileOccupants(engine, adj.col, adj.row, [mage.id, enemy.id]);
+    enemy.col = adj.col;
+    enemy.row = adj.row;
+
+    engine.executeSkill(mage, firaga, enemy.col, enemy.row);
+    assert.equal(engine.canUnitMove(mage), false);
+    assert.equal(engine.getPostActionState(mage), 'SELECT_FACING');
+
+    const newCt = engine.endUnitTurn('N');
+    assert.equal(newCt, 20);
+    assert.equal(mage.facing, 'N');
+
+    const nextTurn = engine.advanceToNextTurn();
+    assert.ok(nextTurn.activeUnit);
+    assert.notEqual(nextTurn.activeUnit.id, mage.id);
+  }
+});

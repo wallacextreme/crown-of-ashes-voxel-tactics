@@ -600,7 +600,16 @@ export class TacticalCombatEngine {
     poisonDamageEvents: { unitId: string; damage: number; killed: boolean }[];
     detonatedMeteor?: ActionExecutionResult['detonatedMeteor'];
   } {
-    this.checkBattleEnd();
+    return this.advanceToNextTurn();
+  }
+
+  advanceToNextTurn(): {
+    activeUnit: BattleUnit | null;
+    burnDamageEvents: { unitId: string; damage: number; killed: boolean }[];
+    poisonDamageEvents: { unitId: string; damage: number; killed: boolean }[];
+    detonatedMeteor?: ActionExecutionResult['detonatedMeteor'];
+  } {
+    this.checkVictoryCondition();
     if (this.combatEnded) {
       this.activeUnitId = null;
       return { activeUnit: null, burnDamageEvents: [], poisonDamageEvents: [] };
@@ -667,26 +676,61 @@ export class TacticalCombatEngine {
 
     // If the active unit died from DoT, immediately advance again
     if (next.hp <= 0) {
-      this.checkBattleEnd();
+      this.checkVictoryCondition();
       if (!this.combatEnded) {
-        return this.startNextTurn();
+        return this.advanceToNextTurn();
       }
       this.activeUnitId = null;
       return { activeUnit: null, burnDamageEvents, poisonDamageEvents, detonatedMeteor };
     }
 
-    this.checkBattleEnd();
+    this.checkVictoryCondition();
     return { activeUnit: next, burnDamageEvents, poisonDamageEvents, detonatedMeteor };
   }
 
-  endTurn(facing: Facing): number {
+  canUnitMove(unit: BattleUnit): boolean {
+    if (unit.hp <= 0 || unit.hasMovedThisTurn || unit.move <= 0) return false;
+    if (hasStatus(unit, 'immobilize')) return false;
+    return this.getMoveRange(unit).size > 1;
+  }
+
+  getPostActionState(unit: BattleUnit): 'VICTORY' | 'DEFEAT' | 'CONTINUE_TURN' | 'SELECT_FACING' {
+    const outcome = this.checkVictoryCondition();
+    if (outcome === 'victory') return 'VICTORY';
+    if (outcome === 'defeat') return 'DEFEAT';
+
+    if (!unit.hasActedThisTurn) {
+      if (unit.hasMovedThisTurn && this.getAvailableSkills(unit).length === 0) {
+        return 'SELECT_FACING';
+      }
+      return 'CONTINUE_TURN';
+    }
+
+    // Case A: Already acted, hasn't moved yet and can still move -> keep turn active
+    if (!unit.hasMovedThisTurn && this.canUnitMove(unit)) {
+      return 'CONTINUE_TURN';
+    }
+
+    // Case B: Already moved (or cannot move) -> select facing to end turn
+    return 'SELECT_FACING';
+  }
+
+  endUnitTurn(facing?: Facing): number {
     const active = this.getActiveUnit();
     if (!active) return 0;
-    active.facing = facing;
+    if (facing) {
+      active.facing = facing;
+    }
     const newCt = resolveEndTurnCT(active, active.hasMovedThisTurn, active.hasActedThisTurn);
+    active.hasMovedThisTurn = false;
+    active.hasActedThisTurn = false;
     this.activeUnitId = null;
-    this.checkBattleEnd();
+    this.checkVictoryCondition();
     return newCt;
+  }
+
+  endTurn(facing: Facing): number {
+    return this.endUnitTurn(facing);
   }
 
   getMoveRange(unit: BattleUnit): Map<string, MoveNode> {
@@ -1067,6 +1111,17 @@ export class TacticalCombatEngine {
     };
   }
 
+  executeAttack(
+    attacker: BattleUnit,
+    targetCol: number,
+    targetRow: number
+  ): ActionExecutionResult | null {
+    const skills = this.getAvailableSkills(attacker);
+    const basic = skills.find((s) => s.isBasic) ?? skills[0];
+    if (!basic) return null;
+    return this.executeSkill(attacker, basic, targetCol, targetRow);
+  }
+
   executeSkill(
     attacker: BattleUnit,
     skill: SkillDef,
@@ -1361,11 +1416,11 @@ export class TacticalCombatEngine {
       });
     }
 
-    this.checkBattleEnd();
+    this.checkVictoryCondition();
     return result;
   }
 
-  checkBattleEnd(): 'victory' | 'defeat' | null {
+  checkVictoryCondition(): 'victory' | 'defeat' | null {
     const alliesAlive = this.units.some((u) => u.team === 'ally' && u.hp > 0);
     const enemiesAlive = this.units.some((u) => u.team === 'enemy' && u.hp > 0);
     if (!enemiesAlive) {
@@ -1376,5 +1431,9 @@ export class TacticalCombatEngine {
       this.combatEnded = null;
     }
     return this.combatEnded;
+  }
+
+  checkBattleEnd(): 'victory' | 'defeat' | null {
+    return this.checkVictoryCondition();
   }
 }

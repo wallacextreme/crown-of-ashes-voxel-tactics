@@ -61,6 +61,7 @@ export interface BattlefieldCallbacks {
   onFacingHover?: (facing: Facing | null) => void;
   onFacingClick?: (facing: Facing) => void;
   onUnitProjections?: (projections: ScreenProjection[]) => void;
+  onFrameTick?: (nowMs: number, rawDt: number) => void;
 }
 
 function facingToYaw(facing: Facing): number {
@@ -109,7 +110,16 @@ export class BattlefieldTactics3D {
   private cursorMesh: THREE.Mesh;
   private parabolicArc: THREE.Line;
   private compassGroup = new THREE.Group();
-  private compassArrows: { facing: Facing; mesh: THREE.Mesh; mat: THREE.MeshStandardMaterial }[] = [];
+  private compassArrows: {
+    facing: Facing;
+    mesh: THREE.Mesh;
+    hitMesh: THREE.Mesh;
+    mat: THREE.MeshStandardMaterial;
+  }[] = [];
+  private compassBaseY = 0;
+
+  public isAnimating = false;
+  private animatingSinceMs = 0;
 
   // Camera FFT Orbit + 90-degree snap + Pan + Zoom + Trauma Shake
   private azimuth = Math.PI * 0.25;
@@ -124,6 +134,7 @@ export class BattlefieldTactics3D {
   private shakeTime = 0;
 
   // Input state
+  private readonly tapThresholdPx = 14;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2(-99, -99);
   private isDraggingOrbit = false;
@@ -131,8 +142,11 @@ export class BattlefieldTactics3D {
   private isMultiTouch = false;
   private lastPinchDist = 0;
   private lastPinchMid = { x: 0, y: 0 };
+  private pointerDownPos = { x: 0, y: 0 };
+  private pointerDownOnCanvas = false;
+  private activePointerId: number | null = null;
   private dragStart = { x: 0, y: 0 };
-  private dragDist = 0;
+  private hasDragged = false;
   private keysDown = new Set<string>();
   private hoveredTile: { col: number; row: number } | null = null;
   private hoveredCompass: Facing | null = null;
@@ -312,14 +326,23 @@ export class BattlefieldTactics3D {
 
   private buildFacingCompass(): void {
     const dirs: { facing: Facing; offset: [number, number]; rotY: number }[] = [
-      { facing: 'N', offset: [0, -0.92], rotY: Math.PI },
-      { facing: 'S', offset: [0, 0.92], rotY: 0 },
-      { facing: 'E', offset: [0.92, 0], rotY: Math.PI / 2 },
-      { facing: 'W', offset: [-0.92, 0], rotY: -Math.PI / 2 },
+      { facing: 'N', offset: [0, -1.08], rotY: Math.PI },
+      { facing: 'S', offset: [0, 1.08], rotY: 0 },
+      { facing: 'E', offset: [1.08, 0], rotY: Math.PI / 2 },
+      { facing: 'W', offset: [-1.08, 0], rotY: -Math.PI / 2 },
     ];
 
-    const arrowShape = new THREE.ConeGeometry(0.24, 0.45, 4);
+    const arrowShape = new THREE.ConeGeometry(0.3, 0.56, 4);
     arrowShape.rotateX(Math.PI / 2);
+
+    // Enlarged invisible touch hit sphere for reliable mobile tapping without neighbor overlap
+    const hitGeom = new THREE.SphereGeometry(0.68, 12, 10);
+    const hitMat = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      colorWrite: false,
+    });
 
     for (const d of dirs) {
       const mat = new THREE.MeshStandardMaterial({
@@ -332,8 +355,14 @@ export class BattlefieldTactics3D {
       mesh.position.set(d.offset[0], 0.35, d.offset[1]);
       mesh.rotation.y = d.rotY;
       mesh.userData = { compassFacing: d.facing };
+
+      const hitMesh = new THREE.Mesh(hitGeom, hitMat);
+      hitMesh.position.set(d.offset[0], 0.42, d.offset[1]);
+      hitMesh.userData = { compassFacing: d.facing };
+
       this.compassGroup.add(mesh);
-      this.compassArrows.push({ facing: d.facing, mesh, mat });
+      this.compassGroup.add(hitMesh);
+      this.compassArrows.push({ facing: d.facing, mesh, hitMesh, mat });
     }
     this.compassGroup.visible = false;
   }
@@ -605,11 +634,24 @@ export class BattlefieldTactics3D {
   showFacingCompass(unit: BattleUnit | null): void {
     if (!unit || !this.engine) {
       this.compassGroup.visible = false;
+      this.hoveredCompass = null;
+      for (const a of this.compassArrows) {
+        a.mat.emissiveIntensity = 1.5;
+        a.mesh.scale.setScalar(1.0);
+      }
       return;
     }
     const wp = this.getUnitAnchorWorldPos(unit);
+    this.compassBaseY = wp.y;
     this.compassGroup.position.copy(wp);
     this.compassGroup.visible = true;
+    this.hoveredCompass = null;
+    for (const a of this.compassArrows) {
+      const isCurrent = a.facing === unit.facing;
+      a.mat.emissiveIntensity = isCurrent ? 2.5 : 1.5;
+      a.mesh.scale.setScalar(isCurrent ? 1.18 : 1.0);
+    }
+    this.compassGroup.updateMatrixWorld(true);
   }
 
   focusOnTile(col: number, row: number): void {
@@ -681,55 +723,70 @@ export class BattlefieldTactics3D {
     onStep?: (col: number, row: number) => void
   ): Promise<void> {
     const uv = this.unitVisuals.get(unitId);
-    if (!uv || !this.engine || path.length <= 1) return;
+    const engine = this.engine;
+    if (!uv || !engine || path.length <= 1) return;
 
-    uv.animState = 'walk';
-    for (let i = 1; i < path.length; i++) {
-      const prev = path[i - 1];
-      const next = path[i];
-      const prevT = this.engine.getTile(prev.col, prev.row);
-      const nextT = this.engine.getTile(next.col, next.row);
-      if (!prevT || !nextT) continue;
+    this.isAnimating = true;
+    this.animatingSinceMs = performance.now();
+    try {
+      uv.animState = 'walk';
+      for (let i = 1; i < path.length; i++) {
+        if (this.disposed) break;
+        const prev = path[i - 1];
+        const next = path[i];
+        const prevT = engine.getTile(prev.col, prev.row);
+        const nextT = engine.getTile(next.col, next.row);
+        if (!prevT || !nextT) continue;
 
-      const p0 = tileCenterWorld(prev.col, prev.row, prevT.height, this.engine.stage.cols, this.engine.stage.rows);
-      const p1 = tileCenterWorld(next.col, next.row, nextT.height, this.engine.stage.cols, this.engine.stage.rows);
-      const u = this.engine.getUnit(unitId);
-      if (u?.footprint === 2) {
-        p0.x += TILE_SIZE * 0.5;
-        p0.z += TILE_SIZE * 0.5;
-        p1.x += TILE_SIZE * 0.5;
-        p1.z += TILE_SIZE * 0.5;
+        const p0 = tileCenterWorld(prev.col, prev.row, prevT.height, engine.stage.cols, engine.stage.rows);
+        const p1 = tileCenterWorld(next.col, next.row, nextT.height, engine.stage.cols, engine.stage.rows);
+        const u = engine.getUnit(unitId);
+        if (u?.footprint === 2) {
+          p0.x += TILE_SIZE * 0.5;
+          p0.z += TILE_SIZE * 0.5;
+          p1.x += TILE_SIZE * 0.5;
+          p1.z += TILE_SIZE * 0.5;
+        }
+
+        const dc = next.col - prev.col;
+        const dr = next.row - prev.row;
+        if (dc !== 0 || dr !== 0) {
+          uv.facing = Math.abs(dc) >= Math.abs(dr) ? (dc > 0 ? 'E' : 'W') : dr > 0 ? 'S' : 'N';
+        }
+
+        const jumpArc = Math.abs(nextT.height - prevT.height) > 0 ? 0.48 : 0.14;
+        const stepDuration = 165 / this.timeScale;
+        const start = performance.now();
+
+        onStep?.(next.col, next.row);
+
+        await new Promise<void>((resolve) => {
+          const tick = () => {
+            if (this.disposed) {
+              resolve();
+              return;
+            }
+            const t = Math.min(1, (performance.now() - start) / stepDuration);
+            uv.worldPos.lerpVectors(p0, p1, t);
+            uv.worldPos.y += Math.sin(t * Math.PI) * jumpArc;
+            if (t >= 1) {
+              uv.col = next.col;
+              uv.row = next.row;
+              resolve();
+            } else {
+              requestAnimationFrame(tick);
+            }
+          };
+          requestAnimationFrame(tick);
+        });
       }
-
-      const dc = next.col - prev.col;
-      const dr = next.row - prev.row;
-      if (dc !== 0 || dr !== 0) {
-        uv.facing = Math.abs(dc) >= Math.abs(dr) ? (dc > 0 ? 'E' : 'W') : dr > 0 ? 'S' : 'N';
+    } finally {
+      if (!uv.isDead) {
+        uv.animState = 'idle';
       }
-
-      const jumpArc = Math.abs(nextT.height - prevT.height) > 0 ? 0.48 : 0.14;
-      const stepDuration = 165 / this.timeScale;
-      const start = performance.now();
-
-      onStep?.(next.col, next.row);
-
-      await new Promise<void>((resolve) => {
-        const tick = () => {
-          const t = Math.min(1, (performance.now() - start) / stepDuration);
-          uv.worldPos.lerpVectors(p0, p1, t);
-          uv.worldPos.y += Math.sin(t * Math.PI) * jumpArc;
-          if (t >= 1) {
-            uv.col = next.col;
-            uv.row = next.row;
-            resolve();
-          } else {
-            requestAnimationFrame(tick);
-          }
-        };
-        requestAnimationFrame(tick);
-      });
+      this.isAnimating = false;
+      this.animatingSinceMs = 0;
     }
-    uv.animState = 'idle';
   }
 
   async animateUnitSkill(
@@ -739,91 +796,120 @@ export class BattlefieldTactics3D {
     targetRow: number,
     aoeTiles: { col: number; row: number }[]
   ): Promise<void> {
-    if (!this.engine) return;
+    const engine = this.engine;
+    if (!engine) return;
     const uv = this.unitVisuals.get(attackerId);
-    const tt = this.engine.getTile(targetCol, targetRow);
-    const targetPos = tileCenterWorld(
-      targetCol,
-      targetRow,
-      tt?.height ?? 1,
-      this.engine.stage.cols,
-      this.engine.stage.rows
-    );
-    const aoePositions = aoeTiles.map((c) => {
-      const tile = this.engine!.getTile(c.col, c.row);
-      return tileCenterWorld(c.col, c.row, tile?.height ?? 1, this.engine!.stage.cols, this.engine!.stage.rows);
-    });
 
-    const attackerPos = uv ? uv.worldPos.clone() : targetPos.clone();
+    this.isAnimating = true;
+    this.animatingSinceMs = performance.now();
+    try {
+      const tt = engine.getTile(targetCol, targetRow);
+      const targetPos = tileCenterWorld(
+        targetCol,
+        targetRow,
+        tt?.height ?? 1,
+        engine.stage.cols,
+        engine.stage.rows
+      );
+      const aoePositions = aoeTiles.map((c) => {
+        const tile = engine.getTile(c.col, c.row);
+        return tileCenterWorld(c.col, c.row, tile?.height ?? 1, engine.stage.cols, engine.stage.rows);
+      });
 
-    if (uv) {
-      if (targetCol !== uv.col || targetRow !== uv.row) {
-        const dc = targetCol - uv.col;
-        const dr = targetRow - uv.row;
-        uv.facing = Math.abs(dc) >= Math.abs(dr) ? (dc > 0 ? 'E' : 'W') : dr > 0 ? 'S' : 'N';
+      const attackerPos = uv ? uv.worldPos.clone() : targetPos.clone();
+
+      if (uv) {
+        if (targetCol !== uv.col || targetRow !== uv.row) {
+          const dc = targetCol - uv.col;
+          const dr = targetRow - uv.row;
+          uv.facing = Math.abs(dc) >= Math.abs(dr) ? (dc > 0 ? 'E' : 'W') : dr > 0 ? 'S' : 'N';
+        }
+
+        // Special Dragoon Sky Dive animation: 120ms crouch anticipation -> supersonic vertical launch + wind rings -> diagonal dive!
+        if (skill.vfxType === 'sky_dive') {
+          uv.rig.bodyPivot.scale.set(1.16, 0.80, 1.16);
+          await new Promise((r) => setTimeout(r, 120 / this.timeScale));
+          this.effects.spawnSkyDiveWindRings(attackerPos);
+
+          uv.animState = 'jump_up';
+          const ascendMs = 220 / this.timeScale;
+          const t0 = performance.now();
+          await new Promise<void>((res) => {
+            const step = () => {
+              if (this.disposed) {
+                res();
+                return;
+              }
+              const p = Math.min(1, (performance.now() - t0) / ascendMs);
+              uv.skyDiveOffsetY = p * 9.0;
+              if (p >= 1) res();
+              else requestAnimationFrame(step);
+            };
+            requestAnimationFrame(step);
+          });
+
+          uv.animState = 'jump_down';
+          const diveMs = 200 / this.timeScale;
+          const t1 = performance.now();
+          const startPos = uv.worldPos.clone();
+          await new Promise<void>((res) => {
+            const step = () => {
+              if (this.disposed) {
+                uv.skyDiveOffsetY = 0;
+                res();
+                return;
+              }
+              const p = Math.min(1, (performance.now() - t1) / diveMs);
+              uv.worldPos.lerpVectors(startPos, targetPos, p);
+              uv.skyDiveOffsetY = (1 - p) * 9.0;
+              if (p >= 1) {
+                uv.skyDiveOffsetY = 0;
+                res();
+              } else requestAnimationFrame(step);
+            };
+            requestAnimationFrame(step);
+          });
+        } else {
+          uv.animState =
+            skill.vfxType === 'dual_strike'
+              ? 'dual'
+              : skill.isBow
+                ? 'bow'
+                : skill.isMagic || skill.isHeal || skill.isBuff || skill.vfxType === 'judgment_blade'
+                  ? 'cast'
+                  : 'slash';
+          uv.animTimer = 0;
+          uv.animDuration = 0.48;
+          await new Promise((r) => setTimeout(r, 220 / this.timeScale));
+        }
       }
 
-      // Special Dragoon Sky Dive animation: 120ms crouch anticipation -> supersonic vertical launch + wind rings -> diagonal dive!
-      if (skill.vfxType === 'sky_dive') {
-        uv.rig.bodyPivot.scale.set(1.16, 0.80, 1.16);
-        await new Promise((r) => setTimeout(r, 120 / this.timeScale));
-        this.effects.spawnSkyDiveWindRings(attackerPos);
-
-        uv.animState = 'jump_up';
-        const ascendMs = 220 / this.timeScale;
-        const t0 = performance.now();
-        await new Promise<void>((res) => {
-          const step = () => {
-            const p = Math.min(1, (performance.now() - t0) / ascendMs);
-            uv.skyDiveOffsetY = p * 9.0;
-            if (p >= 1) res();
-            else requestAnimationFrame(step);
-          };
-          requestAnimationFrame(step);
-        });
-
-        uv.animState = 'jump_down';
-        const diveMs = 200 / this.timeScale;
-        const t1 = performance.now();
-        const startPos = uv.worldPos.clone();
-        await new Promise<void>((res) => {
-          const step = () => {
-            const p = Math.min(1, (performance.now() - t1) / diveMs);
-            uv.worldPos.lerpVectors(startPos, targetPos, p);
-            uv.skyDiveOffsetY = (1 - p) * 9.0;
-            if (p >= 1) {
-              uv.skyDiveOffsetY = 0;
-              res();
-            } else requestAnimationFrame(step);
-          };
-          requestAnimationFrame(step);
-        });
-      } else {
-        uv.animState =
-          skill.vfxType === 'dual_strike'
-            ? 'dual'
-            : skill.isBow
-              ? 'bow'
-              : skill.isMagic || skill.isHeal || skill.isBuff || skill.vfxType === 'judgment_blade'
-                ? 'cast'
-                : 'slash';
-        uv.animTimer = 0;
-        uv.animDuration = 0.48;
-        await new Promise((r) => setTimeout(r, 220 / this.timeScale));
+      const yaw = uv ? facingToYaw(uv.facing) : 0;
+      try {
+        this.effects.playSkillVFX(skill, attackerPos, targetPos, aoePositions, yaw);
+      } catch (err) {
+        console.error('[BattlefieldTactics3D] VFX error during skill animation:', err);
       }
-    }
+      if (skill.vfxType === 'apocalypse_meteor') {
+        this.hitStopTimer = 0.09; // 90ms dramatic impact hit-stop
+      }
+      this.addTrauma(skill.aoeRadius > 0 || skill.vfxType === 'sky_dive' ? 0.55 : 0.25);
 
-    const yaw = uv ? facingToYaw(uv.facing) : 0;
-    this.effects.playSkillVFX(skill, attackerPos, targetPos, aoePositions, yaw);
-    if (skill.vfxType === 'apocalypse_meteor') {
-      this.hitStopTimer = 0.09; // 90ms dramatic impact hit-stop
-    }
-    this.addTrauma(skill.aoeRadius > 0 || skill.vfxType === 'sky_dive' ? 0.55 : 0.25);
-
-    await new Promise((r) => setTimeout(r, 290 / this.timeScale));
-    if (uv && !uv.isDead) {
-      uv.animState = 'idle';
-      uv.worldPos.copy(this.getUnitAnchorWorldPos(this.engine.getUnit(attackerId)!));
+      await new Promise((r) => setTimeout(r, 290 / this.timeScale));
+    } finally {
+      if (uv) {
+        uv.skyDiveOffsetY = 0;
+        uv.rig.bodyPivot.scale.set(1, 1, 1);
+        if (!uv.isDead) {
+          uv.animState = 'idle';
+        }
+        const latestUnit = this.engine?.getUnit(attackerId);
+        if (latestUnit) {
+          uv.worldPos.copy(this.getUnitAnchorWorldPos(latestUnit));
+        }
+      }
+      this.isAnimating = false;
+      this.animatingSinceMs = 0;
     }
   }
 
@@ -893,18 +979,24 @@ export class BattlefieldTactics3D {
 
     this.canvas.addEventListener('pointerdown', (e) => {
       if (this.isMultiTouch) return;
+      this.activePointerId = e.pointerId;
+      this.pointerDownOnCanvas = true;
+      this.pointerDownPos = { x: e.clientX, y: e.clientY };
       this.dragStart = { x: e.clientX, y: e.clientY };
-      this.dragDist = 0;
+      this.hasDragged = false;
       if (e.button === 2 || e.button === 1) {
         this.isDraggingPan = e.button === 2;
         this.isDraggingOrbit = e.button === 1;
-      } else if (e.button === 0) {
+      } else if (e.button === 0 || e.pointerType === 'touch') {
         this.isDraggingOrbit = true;
       }
     });
 
     window.addEventListener('pointermove', (e) => {
       if (this.isMultiTouch) return;
+      if (this.pointerDownOnCanvas && this.activePointerId !== null && e.pointerId !== this.activePointerId) {
+        return;
+      }
       if (!this.isDraggingOrbit && !this.isDraggingPan && e.target !== this.canvas) {
         return;
       }
@@ -912,19 +1004,30 @@ export class BattlefieldTactics3D {
       this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
+      const distFromDown = Math.hypot(
+        e.clientX - this.pointerDownPos.x,
+        e.clientY - this.pointerDownPos.y
+      );
+
       if (this.isDraggingOrbit) {
-        const dx = e.clientX - this.dragStart.x;
-        const dy = e.clientY - this.dragStart.y;
-        this.dragDist += Math.hypot(dx, dy);
-        if (this.dragDist > 6) {
-          this.targetAzimuth -= dx * 0.008;
-          this.targetPolar = THREE.MathUtils.clamp(this.targetPolar - dy * 0.006, 0.42, 1.28);
-          this.dragStart = { x: e.clientX, y: e.clientY };
+        if (distFromDown >= this.tapThresholdPx) {
+          if (!this.hasDragged) {
+            this.hasDragged = true;
+            this.dragStart = { x: e.clientX, y: e.clientY };
+          } else {
+            const dx = e.clientX - this.dragStart.x;
+            const dy = e.clientY - this.dragStart.y;
+            this.targetAzimuth -= dx * 0.008;
+            this.targetPolar = THREE.MathUtils.clamp(this.targetPolar - dy * 0.006, 0.42, 1.28);
+            this.dragStart = { x: e.clientX, y: e.clientY };
+          }
         }
       } else if (this.isDraggingPan) {
+        if (distFromDown >= this.tapThresholdPx) {
+          this.hasDragged = true;
+        }
         const dx = e.clientX - this.dragStart.x;
         const dy = e.clientY - this.dragStart.y;
-        this.dragDist += Math.hypot(dx, dy);
         const right = new THREE.Vector3(Math.cos(this.azimuth), 0, -Math.sin(this.azimuth));
         const fwd = new THREE.Vector3(-Math.sin(this.azimuth), 0, -Math.cos(this.azimuth));
         this.targetFocus.addScaledVector(right, -dx * 0.02);
@@ -936,15 +1039,34 @@ export class BattlefieldTactics3D {
     });
 
     window.addEventListener('pointerup', (e) => {
+      if (this.activePointerId !== null && e.pointerId !== this.activePointerId) return;
       if (this.isMultiTouch) {
+        this.pointerDownOnCanvas = false;
+        this.activePointerId = null;
         this.isDraggingOrbit = false;
         this.isDraggingPan = false;
+        this.hasDragged = false;
         return;
       }
-      const wasClick = this.dragDist <= 6 && e.button === 0 && e.target === this.canvas;
+      const totalMove = Math.hypot(
+        e.clientX - this.pointerDownPos.x,
+        e.clientY - this.pointerDownPos.y
+      );
+      const isTapButton = e.button === 0 || e.pointerType === 'touch';
+      const wasTap =
+        this.pointerDownOnCanvas &&
+        !this.hasDragged &&
+        totalMove < this.tapThresholdPx &&
+        isTapButton &&
+        e.target === this.canvas;
+
+      this.pointerDownOnCanvas = false;
+      this.activePointerId = null;
       this.isDraggingOrbit = false;
       this.isDraggingPan = false;
-      if (wasClick) {
+      this.hasDragged = false;
+
+      if (wasTap) {
         const rect = this.canvas.getBoundingClientRect();
         this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -959,15 +1081,27 @@ export class BattlefieldTactics3D {
       }
     });
 
+    window.addEventListener('pointercancel', (e) => {
+      if (this.activePointerId !== null && e.pointerId !== this.activePointerId) return;
+      this.pointerDownOnCanvas = false;
+      this.activePointerId = null;
+      this.isDraggingOrbit = false;
+      this.isDraggingPan = false;
+      this.hasDragged = false;
+    });
+
     // Multi-touch Pinch-to-Zoom + 2-Finger Pan
     this.canvas.addEventListener(
       'touchstart',
       (e) => {
-        if (e.touches.length === 2) {
+        if (e.touches.length >= 2) {
           e.preventDefault();
           this.isMultiTouch = true;
+          this.pointerDownOnCanvas = false;
+          this.activePointerId = null;
           this.isDraggingOrbit = false;
           this.isDraggingPan = false;
+          this.hasDragged = false;
           const t0 = e.touches[0];
           const t1 = e.touches[1];
           this.lastPinchDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
@@ -1032,10 +1166,10 @@ export class BattlefieldTactics3D {
   private updateRaycastHover(): void {
     this.raycaster.setFromCamera(this.pointer, this.camera);
 
-    // Check facing compass first when visible
+    // Check facing compass first when visible (uses enlarged hit spheres)
     if (this.compassGroup.visible) {
       const compassHits = this.raycaster.intersectObjects(
-        this.compassArrows.map((a) => a.mesh),
+        this.compassArrows.map((a) => a.hitMesh),
         false
       );
       if (compassHits.length > 0) {
@@ -1046,7 +1180,7 @@ export class BattlefieldTactics3D {
         }
         for (const a of this.compassArrows) {
           a.mat.emissiveIntensity = a.facing === f ? 3.2 : 1.5;
-          a.mesh.scale.setScalar(a.facing === f ? 1.35 : 1.0);
+          a.mesh.scale.setScalar(a.facing === f ? 1.38 : 1.0);
         }
         return;
       } else if (this.hoveredCompass !== null) {
@@ -1084,6 +1218,13 @@ export class BattlefieldTactics3D {
       if (this.disposed) return;
       this.timer.update();
       const rawDt = Math.min(Math.max(this.timer.getDelta(), 0), 0.1);
+      const nowMs = performance.now();
+      if (this.isAnimating && this.animatingSinceMs > 0 && nowMs - this.animatingSinceMs > 4000) {
+        console.warn('[BattlefieldTactics3D] Watchdog released stuck animation lock.');
+        this.isAnimating = false;
+        this.animatingSinceMs = 0;
+      }
+      this.callbacks.onFrameTick?.(nowMs, rawDt);
       if (this.hitStopTimer > 0) {
         this.hitStopTimer = Math.max(0, this.hitStopTimer - rawDt);
       }
@@ -1154,7 +1295,7 @@ export class BattlefieldTactics3D {
       this.telegraphMat.opacity = 0.45 + pulse * 0.38;
       this.cursorMesh.scale.setScalar(0.96 + pulse * 0.08);
       if (this.compassGroup.visible) {
-        this.compassGroup.position.y += Math.sin(this.elapsed * 5) * 0.0005;
+        this.compassGroup.position.y = this.compassBaseY + Math.sin(this.elapsed * 5) * 0.04;
       }
 
       // Animate PointLight pool back to 0 cleanly

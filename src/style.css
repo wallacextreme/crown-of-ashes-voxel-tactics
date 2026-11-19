@@ -189,7 +189,7 @@ body {
   grid-template-columns: minmax(185px, 1fr) auto minmax(340px, auto);
   gap: 8px;
   align-items: center;
-  z-index: 15;
+  z-index: 18;
   pointer-events: none;
 }
 
@@ -738,6 +738,31 @@ body {
   background: rgba(180, 120, 28, 0.42);
 }
 
+.face-btn.selected {
+  border-color: var(--gold-bright);
+  background: rgba(212, 163, 72, 0.35);
+  box-shadow: 0 0 8px rgba(253, 230, 138, 0.35);
+}
+
+.confirm-facing-btn {
+  width: 100%;
+  margin-top: 7px;
+  padding: 10px 12px;
+  min-height: 42px;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+  border-color: #4ade80;
+  background: linear-gradient(180deg, #16a34a, #15803d);
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(74, 222, 128, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.confirm-facing-btn:hover {
+  border-color: #86efac;
+  background: linear-gradient(180deg, #22c55e, #16a34a);
+}
+
 /* RIGHT TARGET & FORECAST */
 .tile-inspector {
   display: flex;
@@ -1045,7 +1070,7 @@ body {
   }
 }
 
-@media (max-width: 767px) {
+@media (max-width: 768px) {
   #top-hud {
     grid-template-columns: 1fr;
     grid-template-rows: auto auto auto;
@@ -1089,6 +1114,11 @@ body {
     grid-row: 3;
     width: 100%;
     justify-self: stretch;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .ctb-slot {
+    flex: 0 0 auto;
   }
   .ctb-label {
     display: none;
@@ -1098,25 +1128,38 @@ body {
     right: max(8px, env(safe-area-inset-right));
     bottom: max(8px, env(safe-area-inset-bottom));
     width: auto;
-    max-height: 40vh;
+    max-height: 46vh;
     overflow-y: auto;
   }
   .right-panel {
-    top: var(--top-hud-height, 138px);
+    top: var(--top-hud-height, 152px);
     bottom: auto;
     left: max(8px, env(safe-area-inset-left));
     right: max(8px, env(safe-area-inset-right));
     width: auto;
-    max-height: 34vh;
+    padding: 7px 9px;
+    max-height: 30vh;
     overflow-y: auto;
   }
+  .right-panel .tile-inspector {
+    padding-bottom: 5px;
+    font-size: 11px;
+  }
+  .right-panel .unit-avatar {
+    width: 32px;
+    height: 32px;
+    font-size: 16px;
+  }
+  .controls-hint {
+    display: none;
+  }
   .open-target-pill {
-    top: var(--top-hud-height, 138px);
+    top: var(--top-hud-height, 152px);
     bottom: auto;
     right: max(8px, env(safe-area-inset-right));
   }
   .cast-banner {
-    top: var(--top-hud-height, 138px);
+    top: var(--top-hud-height, 152px);
     font-size: 13px;
     padding: 6px 18px;
     max-width: 94vw;

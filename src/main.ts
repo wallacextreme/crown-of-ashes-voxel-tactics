@@ -21,7 +21,7 @@ import { STEP_HEIGHT, TILE_SIZE, tileCenterWorld } from './three/TerrainDioramaV
 import type { BattleUnit, Facing, SkillDef } from './types/tactics.ts';
 import { BarracksModal } from './ui/BarracksModal.ts';
 
-type InputPhase = 'busy' | 'command' | 'move' | 'target' | 'facing' | 'ended';
+type InputPhase = 'busy' | 'command' | 'move' | 'target' | 'SELECT_FACING' | 'ended';
 
 const SURFACE_NAMES: Record<string, string> = {
   grass: 'Grama',
@@ -53,6 +53,9 @@ class GameController {
   private engine!: TacticalCombatEngine;
 
   private phase: InputPhase = 'busy';
+  private isBusy = false;
+  private busySinceMs = 0;
+  private battleSessionId = 0;
   private moveMap = new Map<string, MoveNode>();
   private selectedSkill: SkillDef | null = null;
   private targetableSet = new Set<string>();
@@ -89,8 +92,9 @@ class GameController {
     this.battlefield = new BattlefieldTactics3D(canvas, {
       onTileHover: (c, r) => this.handleTileHover(c, r),
       onTileClick: (c, r) => void this.handleTileClick(c, r),
-      onFacingClick: (f) => void this.handleFacingSelected(f),
+      onFacingClick: (f) => void this.confirmFacing(f),
       onUnitProjections: (list) => this.updateFloatingBars(list),
+      onFrameTick: (nowMs) => this.checkBusyWatchdog(nowMs),
     });
 
     this.barracks = new BarracksModal(
@@ -106,20 +110,33 @@ class GameController {
     }
 
     // Start collapsed target inspector on narrow portrait phones to keep the 3D board wide open
-    if (window.innerWidth <= 767) {
+    if (window.innerWidth <= 768) {
       this.setTargetCollapsed(true);
     }
 
     this.bindUiControls();
     this.syncHudHeightVar();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => this.syncHudHeightVar());
+      ro.observe(this.topHudEl);
+    }
     window.addEventListener('resize', () => this.syncHudHeightVar());
+    window.addEventListener('orientationchange', () => this.syncHudHeightVar());
     this.startStage(this.campaign.getData().selectedStageId || 1);
+  }
+
+  private setBusy(busy: boolean): void {
+    this.isBusy = busy;
+    this.busySinceMs = busy ? performance.now() : 0;
+    if (busy) {
+      this.phase = 'busy';
+    }
   }
 
   private syncHudHeightVar(): void {
     const h = this.topHudEl.classList.contains('hidden')
       ? 12
-      : Math.ceil(this.topHudEl.getBoundingClientRect().bottom + 6);
+      : Math.ceil(this.topHudEl.getBoundingClientRect().bottom + 8);
     document.documentElement.style.setProperty('--top-hud-height', `${h}px`);
   }
 
@@ -211,6 +228,7 @@ class GameController {
       this.setTargetCollapsed(false);
     });
     document.getElementById('btn-close-skills')?.addEventListener('click', () => {
+      if (this.isBusy || this.phase === 'ended') return;
       const active = this.engine.getActiveUnit();
       this.audio.playUiCancel();
       this.skillsMenuOpen = false;
@@ -223,14 +241,15 @@ class GameController {
       if (active) this.updateCommandMenuButtons(active);
     });
     document.getElementById('btn-close-facing')?.addEventListener('click', () => {
+      if (this.isBusy || this.phase === 'ended') return;
       const active = this.engine.getActiveUnit();
       this.audio.playUiCancel();
-      if (this.phase === 'facing') this.phase = 'command';
+      if (this.phase === 'SELECT_FACING') this.phase = 'command';
       this.battlefield.showFacingCompass(null);
       if (active) this.updateCommandMenuButtons(active);
     });
     document.getElementById('btn-confirm-forecast')?.addEventListener('click', () => {
-      if (this.pendingTargetCell && this.phase === 'target' && this.selectedSkill) {
+      if (!this.isBusy && this.pendingTargetCell && this.phase === 'target' && this.selectedSkill) {
         void this.executeTargetedSkillAt(this.pendingTargetCell.col, this.pendingTargetCell.row);
       }
     });
@@ -238,13 +257,34 @@ class GameController {
     document.getElementById('cmd-move')?.addEventListener('click', () => this.enterMoveMode());
     document.getElementById('cmd-attack')?.addEventListener('click', () => this.enterBasicAttackMode());
     document.getElementById('cmd-skills')?.addEventListener('click', () => this.toggleSkillsMenu());
-    document.getElementById('cmd-wait')?.addEventListener('click', () => this.enterFacingMode());
+    document.getElementById('cmd-wait')?.addEventListener('click', () => this.waitAction());
+
+    document.getElementById('btn-confirm-facing')?.addEventListener('click', () => {
+      if (this.isBusy || this.phase === 'ended') return;
+      const active = this.engine.getActiveUnit();
+      if (active && active.team === 'ally' && this.phase === 'SELECT_FACING') {
+        void this.confirmFacing(active.facing);
+      }
+    });
 
     document.querySelectorAll<HTMLButtonElement>('.face-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
+        if (this.isBusy || this.phase === 'ended') return;
         const f = btn.dataset.facing as Facing;
-        if (f) void this.handleFacingSelected(f);
+        if (f) void this.confirmFacing(f);
       });
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ' && e.code !== 'Space') return;
+      if (this.isBusy || this.phase !== 'SELECT_FACING') return;
+      const barracksOpen = !document.getElementById('barracks-modal')?.classList.contains('hidden');
+      const resultOpen = !document.getElementById('result-modal')?.classList.contains('hidden');
+      if (barracksOpen || resultOpen) return;
+      const active = this.engine?.getActiveUnit();
+      if (!active || active.team !== 'ally') return;
+      e.preventDefault();
+      void this.confirmFacing(active.facing);
     });
 
     document.getElementById('btn-result-barracks')?.addEventListener('click', () => {
@@ -264,13 +304,17 @@ class GameController {
   }
 
   startStage(stageId: number): void {
+    this.battleSessionId++;
     const stage = getStageDef(stageId);
     const heroes = this.campaign.getDeployedHeroes();
     this.engine = new TacticalCombatEngine(stage, heroes);
     this.stageBonusGold = 0;
     this.stageBonusJp = 0;
+    this.isBusy = false;
+    this.busySinceMs = 0;
     this.phase = 'busy';
     this.selectedSkill = null;
+    this.pendingTargetCell = null;
     this.skillsMenuOpen = false;
 
     // Clear old floating unit bars
@@ -282,6 +326,7 @@ class GameController {
     this.battlefield.syncFromEngine(this.engine);
     this.refreshHudHeader();
     this.renderCTBTimeline();
+    requestAnimationFrame(() => this.syncHudHeightVar());
 
     void this.advanceTurn();
   }
@@ -344,6 +389,7 @@ class GameController {
         `;
       })
       .join('');
+    requestAnimationFrame(() => this.syncHudHeightVar());
   }
 
   private async showCastBanner(text: string, durationMs = 1500): Promise<void> {
@@ -355,61 +401,94 @@ class GameController {
 
   private async advanceTurn(): Promise<void> {
     if (this.phase === 'ended') return;
-    this.phase = 'busy';
-    this.battlefield.clearHighlights();
-    this.battlefield.showFacingCompass(null);
-    this.battlefield.setParabolicArc(null, null);
-    this.hideForecast();
+    const session = this.battleSessionId;
+    this.setBusy(true);
 
-    const turnRes = this.engine.startNextTurn();
+    try {
+      while (session === this.battleSessionId && !this.engine.combatEnded && (this.phase as InputPhase) !== 'ended') {
+        this.battlefield.clearHighlights();
+        this.battlefield.showFacingCompass(null);
+        this.battlefield.setParabolicArc(null, null);
+        this.hideForecast();
 
-    for (const b of turnRes.burnDamageEvents) {
-      const u = this.engine.getUnit(b.unitId);
-      if (u) this.spawnUnitTextPopup(u, `-${b.damage} 🔥`, 'fall');
-    }
-    for (const p of turnRes.poisonDamageEvents) {
-      const u = this.engine.getUnit(p.unitId);
-      if (u) this.spawnUnitTextPopup(u, `-${p.damage} ☠️`, 'fall');
-    }
+        this.busySinceMs = performance.now();
+        const turnRes = this.engine.advanceToNextTurn();
 
-    if (turnRes.detonatedMeteor) {
-      const m = turnRes.detonatedMeteor;
-      const beliasSkill = JOBS.belias_boss.skills[2];
-      const aoe = this.engine.getAoeTiles(m.centerCol, m.centerRow, beliasSkill);
-      this.battlefield.focusOnTile(m.centerCol, m.centerRow);
-      this.audio.playSkillSfx(beliasSkill);
-      void this.showCastBanner('☄️ APOCALYPSE METEOR DETONOU!', 1800);
-      await this.battlefield.animateUnitSkill('e5_belias', beliasSkill, m.centerCol, m.centerRow, aoe);
-      for (const h of m.hits) {
-        const u = this.engine.getUnit(h.targetId);
-        if (u) {
-          this.battlefield.triggerHitFeedback(u.id, true, false, h.killed);
-          this.spawnUnitTextPopup(u, `-${h.damage} ☄️`, 'crit');
+        for (const b of turnRes.burnDamageEvents) {
+          const u = this.engine.getUnit(b.unitId);
+          if (u) this.spawnUnitTextPopup(u, `-${b.damage} 🔥`, 'fall');
+        }
+        for (const p of turnRes.poisonDamageEvents) {
+          const u = this.engine.getUnit(p.unitId);
+          if (u) this.spawnUnitTextPopup(u, `-${p.damage} ☠️`, 'fall');
+        }
+
+        if (turnRes.detonatedMeteor) {
+          const m = turnRes.detonatedMeteor;
+          const beliasSkill = JOBS.belias_boss.skills[2];
+          const aoe = this.engine.getAoeTiles(m.centerCol, m.centerRow, beliasSkill);
+          this.battlefield.focusOnTile(m.centerCol, m.centerRow);
+          this.audio.playSkillSfx(beliasSkill);
+          void this.showCastBanner('☄️ APOCALYPSE METEOR DETONOU!', 1800);
+          await this.battlefield.animateUnitSkill('e5_belias', beliasSkill, m.centerCol, m.centerRow, aoe);
+          if (session !== this.battleSessionId) return;
+          for (const h of m.hits) {
+            const u = this.engine.getUnit(h.targetId);
+            if (u) {
+              this.battlefield.triggerHitFeedback(u.id, true, false, h.killed);
+              this.spawnUnitTextPopup(u, `-${h.damage} ☄️`, 'crit');
+            }
+          }
+          this.battlefield.syncFromEngine(this.engine);
+        }
+
+        const outcome = this.engine.checkVictoryCondition();
+        if (outcome) {
+          this.handleBattleEnd(outcome);
+          return;
+        }
+
+        const active = turnRes.activeUnit;
+        if (!active) return;
+
+        this.battlefield.syncFromEngine(this.engine);
+        this.battlefield.focusOnTile(active.col, active.row);
+        this.refreshHudHeader();
+        this.renderCTBTimeline();
+        this.renderActiveHeroPanel(active);
+
+        if (active.team === 'ally') {
+          this.phase = 'command';
+          this.skillsMenuOpen = false;
+          return;
+        }
+
+        await this.executeEnemyTurn(active, session);
+      }
+    } catch (err) {
+      console.error('[GameController] Error in advanceTurn:', err);
+    } finally {
+      if (session === this.battleSessionId) {
+        this.isBusy = false;
+        this.busySinceMs = 0;
+        const outcome = this.engine.checkVictoryCondition();
+        if (outcome && (this.phase as InputPhase) !== 'ended') {
+          this.handleBattleEnd(outcome);
+        } else if ((this.phase as InputPhase) !== 'ended') {
+          const active = this.engine.getActiveUnit();
+          if (active && active.team === 'ally') {
+            if (this.phase === 'busy') {
+              this.phase = 'command';
+            }
+            this.renderActiveHeroPanel(active);
+            this.updateCommandMenuButtons(active);
+          } else if (active && active.team === 'enemy') {
+            this.engine.endUnitTurn(active.facing);
+            this.battlefield.syncFromEngine(this.engine);
+            queueMicrotask(() => void this.advanceTurn());
+          }
         }
       }
-      this.battlefield.syncFromEngine(this.engine);
-    }
-
-    if (this.engine.combatEnded) {
-      this.handleBattleEnd(this.engine.combatEnded);
-      return;
-    }
-
-    const active = turnRes.activeUnit;
-    if (!active) return;
-
-    this.battlefield.syncFromEngine(this.engine);
-    this.battlefield.focusOnTile(active.col, active.row);
-    this.refreshHudHeader();
-    this.renderCTBTimeline();
-    this.renderActiveHeroPanel(active);
-
-    if (active.team === 'ally') {
-      this.phase = 'command';
-      this.skillsMenuOpen = false;
-      this.updateCommandMenuButtons(active);
-    } else {
-      await this.executeEnemyTurn(active);
     }
   }
 
@@ -450,35 +529,55 @@ class GameController {
   }
 
   private updateCommandMenuButtons(active: BattleUnit): void {
-    const isPlayerTurn = active.team === 'ally' && this.phase !== 'busy' && this.phase !== 'ended';
+    const isPlayerTurn = active.team === 'ally' && !this.isBusy && this.phase !== 'ended';
     const cmdMove = document.getElementById('cmd-move') as HTMLButtonElement;
     const cmdAttack = document.getElementById('cmd-attack') as HTMLButtonElement;
     const cmdSkills = document.getElementById('cmd-skills') as HTMLButtonElement;
     const cmdWait = document.getElementById('cmd-wait') as HTMLButtonElement;
 
-    cmdMove.disabled = !isPlayerTurn || active.hasMovedThisTurn;
-    cmdAttack.disabled = !isPlayerTurn || active.hasActedThisTurn;
-    cmdSkills.disabled = !isPlayerTurn || active.hasActedThisTurn;
+    const canMove = this.engine.canUnitMove(active);
+    const canAct = !active.hasActedThisTurn && this.engine.getAvailableSkills(active).length > 0;
+
+    cmdMove.disabled = !isPlayerTurn || !canMove;
+    cmdAttack.disabled = !isPlayerTurn || !canAct;
+    cmdSkills.disabled = !isPlayerTurn || !canAct;
+    // ESPERAR / DIREÇÃO never disables during an ally hero's turn (except while isBusy animating)
     cmdWait.disabled = !isPlayerTurn;
 
     cmdMove.classList.toggle('active', this.phase === 'move');
     cmdAttack.classList.toggle('active', this.phase === 'target' && Boolean(this.selectedSkill?.isBasic));
     cmdSkills.classList.toggle('active', this.skillsMenuOpen || (this.phase === 'target' && !this.selectedSkill?.isBasic));
-    cmdWait.classList.toggle('active', this.phase === 'facing');
+    cmdWait.classList.toggle('active', this.phase === 'SELECT_FACING');
 
     const waitGain = !active.hasMovedThisTurn && !active.hasActedThisTurn ? 40 : active.hasMovedThisTurn !== active.hasActedThisTurn ? 20 : 0;
-    document.getElementById('wait-ct-hint')!.textContent = waitGain > 0 ? `+${waitGain} CT` : 'Concluir';
+    const waitLabel = document.getElementById('wait-btn-label');
+    if (waitLabel) {
+      waitLabel.textContent = this.phase === 'SELECT_FACING' ? '✅ PASSAR VEZ' : '🧭 ESPERAR / DIREÇÃO';
+    }
+    document.getElementById('wait-ct-hint')!.textContent =
+      this.phase === 'SELECT_FACING'
+        ? 'Confirmar / Enter'
+        : waitGain > 0
+          ? `+${waitGain} CT`
+          : 'Encerrar turno';
+
+    document.querySelectorAll<HTMLButtonElement>('.face-btn').forEach((btn) => {
+      btn.classList.toggle('selected', btn.dataset.facing === active.facing);
+    });
 
     this.skillsSubmenuEl.classList.toggle('hidden', !this.skillsMenuOpen);
-    this.facingSubmenuEl.classList.toggle('hidden', this.phase !== 'facing');
+    this.facingSubmenuEl.classList.toggle('hidden', this.phase !== 'SELECT_FACING');
   }
 
   private enterMoveMode(): void {
     const active = this.engine.getActiveUnit();
-    if (!active || active.team !== 'ally' || active.hasMovedThisTurn || this.phase === 'busy') return;
+    if (!active || active.team !== 'ally' || !this.engine.canUnitMove(active) || this.isBusy || this.phase === 'busy' || this.phase === 'ended') {
+      return;
+    }
     this.audio.playUiConfirm();
     this.skillsMenuOpen = false;
     this.selectedSkill = null;
+    this.pendingTargetCell = null;
     this.battlefield.showFacingCompass(null);
     this.battlefield.setParabolicArc(null, null);
     this.hideForecast();
@@ -493,9 +592,11 @@ class GameController {
 
   private enterBasicAttackMode(): void {
     const active = this.engine.getActiveUnit();
-    if (!active || active.team !== 'ally' || active.hasActedThisTurn || this.phase === 'busy') return;
+    if (!active || active.team !== 'ally' || active.hasActedThisTurn || this.isBusy || this.phase === 'busy' || this.phase === 'ended') {
+      return;
+    }
     const skills = this.engine.getAvailableSkills(active);
-    const basic = skills[0];
+    const basic = skills.find((s) => s.isBasic) ?? skills[0];
     if (basic) {
       this.skillsMenuOpen = false;
       this.enterSkillTargetMode(basic);
@@ -504,7 +605,9 @@ class GameController {
 
   private toggleSkillsMenu(): void {
     const active = this.engine.getActiveUnit();
-    if (!active || active.team !== 'ally' || active.hasActedThisTurn || this.phase === 'busy') return;
+    if (!active || active.team !== 'ally' || active.hasActedThisTurn || this.isBusy || this.phase === 'busy' || this.phase === 'ended') {
+      return;
+    }
     this.audio.playUiConfirm();
     this.skillsMenuOpen = !this.skillsMenuOpen;
     this.battlefield.clearHighlights();
@@ -538,7 +641,9 @@ class GameController {
 
   private enterSkillTargetMode(skill: SkillDef): void {
     const active = this.engine.getActiveUnit();
-    if (!active || active.team !== 'ally' || active.hasActedThisTurn) return;
+    if (!active || active.team !== 'ally' || active.hasActedThisTurn || this.isBusy || this.phase === 'busy' || this.phase === 'ended') {
+      return;
+    }
     this.audio.playUiConfirm();
     this.selectedSkill = skill;
     this.pendingTargetCell = null;
@@ -552,18 +657,96 @@ class GameController {
     this.updateCommandMenuButtons(active);
   }
 
-  private enterFacingMode(): void {
+  private syncPostActionState(active: BattleUnit): void {
+    if (this.phase === 'ended') return;
+    const postState = this.engine.getPostActionState(active);
+    if (postState === 'VICTORY') {
+      this.handleBattleEnd('victory');
+      return;
+    }
+    if (postState === 'DEFEAT') {
+      this.handleBattleEnd('defeat');
+      return;
+    }
+    if (postState === 'SELECT_FACING') {
+      this.enterFacingMode(false);
+      return;
+    }
+    this.phase = 'command';
+    this.battlefield.showFacingCompass(null);
+    this.renderActiveHeroPanel(active);
+    this.updateCommandMenuButtons(active);
+  }
+
+  private enterFacingMode(playSfx = true): void {
+    if (this.isBusy || this.phase === 'ended') return;
     const active = this.engine.getActiveUnit();
-    if (!active || active.team !== 'ally' || this.phase === 'busy') return;
-    this.audio.playUiConfirm();
+    if (!active || active.team !== 'ally') return;
+    if (playSfx) this.audio.playUiConfirm();
     this.skillsMenuOpen = false;
     this.selectedSkill = null;
-    this.phase = 'facing';
+    this.pendingTargetCell = null;
+    this.phase = 'SELECT_FACING';
     this.battlefield.clearHighlights();
     this.battlefield.setParabolicArc(null, null);
     this.hideForecast();
     this.battlefield.showFacingCompass(active);
+    this.battlefield.focusOnTile(active.col, active.row);
+    if (this.heroCollapsed) {
+      this.setHeroCollapsed(false);
+    }
+    this.renderActiveHeroPanel(active);
     this.updateCommandMenuButtons(active);
+    requestAnimationFrame(() => {
+      this.facingSubmenuEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+  }
+
+  private waitAction(): void {
+    if (this.isBusy || this.phase === 'ended') return;
+    const active = this.engine.getActiveUnit();
+    if (!active || active.team !== 'ally') return;
+    if (this.phase === 'SELECT_FACING') {
+      void this.confirmFacing(active.facing);
+      return;
+    }
+    this.enterFacingMode(true);
+  }
+
+  private checkBusyWatchdog(nowMs: number): void {
+    if (!this.isBusy || this.busySinceMs <= 0 || this.phase === 'ended') return;
+    if (nowMs - this.busySinceMs <= 4000) return;
+
+    console.warn('[GameController] Watchdog released stuck busy lock after 4.0s.');
+    this.isBusy = false;
+    this.busySinceMs = 0;
+    this.battlefield.isAnimating = false;
+    this.battlefield.clearHighlights();
+    this.battlefield.setParabolicArc(null, null);
+    this.hideForecast();
+    this.battlefield.syncFromEngine(this.engine);
+
+    const outcome = this.engine.checkVictoryCondition();
+    if (outcome) {
+      this.handleBattleEnd(outcome);
+      return;
+    }
+
+    const active = this.engine.getActiveUnit();
+    if (!active || active.hp <= 0) {
+      void this.advanceTurn();
+      return;
+    }
+
+    if (active.team === 'enemy') {
+      this.engine.endUnitTurn(active.facing);
+      this.battlefield.syncFromEngine(this.engine);
+      this.renderCTBTimeline();
+      void this.advanceTurn();
+      return;
+    }
+
+    this.syncPostActionState(active);
   }
 
   private handleTileHover(col: number | null, row: number | null): void {
@@ -642,7 +825,7 @@ class GameController {
   }
 
   private async handleTileClick(col: number, row: number): Promise<void> {
-    if (this.phase === 'busy' || this.phase === 'ended') return;
+    if (this.isBusy || this.phase === 'busy' || this.phase === 'ended') return;
     const active = this.engine.getActiveUnit();
     if (!active || active.team !== 'ally') return;
 
@@ -652,38 +835,43 @@ class GameController {
         this.audio.playUiCancel();
         return;
       }
-      this.phase = 'busy';
+      const session = this.battleSessionId;
+      this.setBusy(true);
       this.battlefield.clearHighlights();
+      this.updateCommandMenuButtons(active);
 
-      await this.battlefield.animateUnitMovePath(active.id, node.path, () => {
-        this.audio.playStep();
-      });
+      try {
+        await this.battlefield.animateUnitMovePath(active.id, node.path, () => {
+          this.audio.playStep();
+        });
+        if (session !== this.battleSessionId) return;
 
-      const moveRes = this.engine.moveUnit(active, col, row);
-      if (moveRes.openedChest) {
-        this.audio.playVictoryFanfare();
-        this.campaign.addGold(moveRes.openedChest.gold);
-        this.stageBonusGold += moveRes.openedChest.gold;
-        if (moveRes.openedChest.itemId) {
-          this.campaign.addInventoryItem(moveRes.openedChest.itemId);
+        const moveRes = this.engine.moveUnit(active, col, row);
+        if (moveRes.openedChest) {
+          this.audio.playVictoryFanfare();
+          this.campaign.addGold(moveRes.openedChest.gold);
+          this.stageBonusGold += moveRes.openedChest.gold;
+          if (moveRes.openedChest.itemId) {
+            this.campaign.addInventoryItem(moveRes.openedChest.itemId);
+          }
+          const eqName = getEquipmentDef(moveRes.openedChest.itemId)?.name;
+          void this.showCastBanner(
+            `📦 BAÚ ABERTO! +${moveRes.openedChest.gold} 🪙${eqName ? ` + ${eqName}!` : ''}`,
+            2100
+          );
+          this.refreshHudHeader();
         }
-        const eqName = getEquipmentDef(moveRes.openedChest.itemId)?.name;
-        void this.showCastBanner(
-          `📦 BAÚ ABERTO! +${moveRes.openedChest.gold} 🪙${eqName ? ` + ${eqName}!` : ''}`,
-          2100
-        );
-        this.refreshHudHeader();
-      }
 
-      this.campaign.awardActionEXPAndJP(active.rosterUid, 12, 10);
-      this.battlefield.syncFromEngine(this.engine);
-
-      if (active.hasActedThisTurn) {
-        this.enterFacingMode();
-      } else {
-        this.phase = 'command';
-        this.renderActiveHeroPanel(active);
-        this.updateCommandMenuButtons(active);
+        this.campaign.awardActionEXPAndJP(active.rosterUid, 12, 10);
+        this.battlefield.syncFromEngine(this.engine);
+      } catch (err) {
+        console.error('[GameController] Error during move sequence:', err);
+      } finally {
+        if (session === this.battleSessionId) {
+          this.isBusy = false;
+          this.busySinceMs = 0;
+          this.syncPostActionState(active);
+        }
       }
       return;
     }
@@ -714,8 +902,9 @@ class GameController {
   }
 
   private async executeTargetedSkillAt(col: number, row: number): Promise<void> {
+    if (this.isBusy || this.phase === 'ended') return;
     const active = this.engine.getActiveUnit();
-    if (!active || !this.selectedSkill || this.phase !== 'target') return;
+    if (!active || active.team !== 'ally' || !this.selectedSkill || this.phase !== 'target') return;
     if (!this.targetableSet.has(tileKey(col, row))) {
       this.audio.playUiCancel();
       return;
@@ -727,15 +916,22 @@ class GameController {
     }
 
     const skill = this.selectedSkill;
-    this.phase = 'busy';
+    const session = this.battleSessionId;
+    this.setBusy(true);
     this.skillsMenuOpen = false;
     this.selectedSkill = null;
     this.pendingTargetCell = null;
     this.battlefield.clearHighlights();
     this.battlefield.setParabolicArc(null, null);
     this.hideForecast();
+    this.updateCommandMenuButtons(active);
 
-    const exec = this.engine.executeSkill(active, skill, col, row);
+    try {
+      const basicSkillId = this.engine.getAvailableSkills(active).find((s) => s.isBasic)?.id;
+      const exec =
+        skill.isBasic && skill.id === basicSkillId
+          ? this.engine.executeAttack(active, col, row) ?? this.engine.executeSkill(active, skill, col, row)
+          : this.engine.executeSkill(active, skill, col, row);
       this.audio.playSkillSfx(skill);
 
       if (skill.jpCost > 0 || !skill.isBasic) {
@@ -743,6 +939,7 @@ class GameController {
       }
 
       await this.battlefield.animateUnitSkill(active.id, skill, col, row, exec.aoeTiles);
+      if (session !== this.battleSessionId) return;
 
       let totalExp = 24;
       let totalJp = 22;
@@ -792,106 +989,143 @@ class GameController {
       this.battlefield.syncFromEngine(this.engine);
       this.renderActiveHeroPanel(active);
       this.renderCTBTimeline();
-
-      if (this.engine.combatEnded) {
-        this.handleBattleEnd(this.engine.combatEnded);
-        return;
-      }
-
-      if (active.hasMovedThisTurn) {
-        this.enterFacingMode();
-      } else {
-        this.phase = 'command';
-        this.updateCommandMenuButtons(active);
-      }
-  }
-
-  private async handleFacingSelected(facing: Facing): Promise<void> {
-    if (this.phase !== 'facing') return;
-    this.audio.playUiConfirm();
-    this.battlefield.showFacingCompass(null);
-    this.engine.endTurn(facing);
-    this.battlefield.syncFromEngine(this.engine);
-    await this.advanceTurn();
-  }
-
-  private async executeEnemyTurn(enemy: BattleUnit): Promise<void> {
-    const decision = TacticalAI.chooseBestAction(this.engine, enemy);
-
-    if (decision.moveCol !== enemy.col || decision.moveRow !== enemy.row) {
-      await this.battlefield.animateUnitMovePath(enemy.id, decision.movePath, () => {
-        this.audio.playStep();
-      });
-      this.engine.moveUnit(enemy, decision.moveCol, decision.moveRow);
-      this.battlefield.syncFromEngine(this.engine);
-    }
-
-    if (decision.skill) {
-      this.battlefield.focusOnTile(decision.targetCol, decision.targetRow);
-      await this.showCastBanner(
-        `⚔️ ${enemy.name.toUpperCase()} CONJURA: ${decision.skill.name.toUpperCase()}!`,
-        1450
-      );
-      const exec = this.engine.executeSkill(enemy, decision.skill, decision.targetCol, decision.targetRow);
-      this.audio.playSkillSfx(decision.skill);
-      await this.battlefield.animateUnitSkill(
-        enemy.id,
-        decision.skill,
-        decision.targetCol,
-        decision.targetRow,
-        exec.aoeTiles
-      );
-
-      if (exec.telegraphedMeteor) {
-        void this.showCastBanner('🔥 CHÃO MARCADO! SAIA DA ÁREA EM 1 TURNO!', 1750);
-      }
-
-      for (const h of exec.hits) {
-        const target = this.engine.getUnit(h.targetId);
-        if (!target) continue;
-        if (h.isBlocked) {
-          this.audio.playShieldBlock();
-          this.battlefield.triggerHitFeedback(target.id, false, true, false);
-          this.spawnUnitTextPopup(target, 'BLOQUEADO!', 'block');
-        } else if (h.isEvaded) {
-          this.spawnUnitTextPopup(target, 'ESQUIVOU!', 'block');
-        } else if (h.healed > 0) {
-          this.spawnUnitTextPopup(target, `+${h.healed}`, 'heal');
-        } else if (h.damage > 0) {
-          if (h.isCrit) this.audio.playCriticalHit();
-          this.battlefield.triggerHitFeedback(target.id, h.isCrit, false, h.killed);
-          this.spawnUnitTextPopup(
-            target,
-            h.isCrit ? `CRÍTICO! -${h.damage}` : `-${h.damage}`,
-            h.isCrit ? 'crit' : 'normal'
-          );
-          if (h.fallDamage > 0) {
-            this.spawnUnitTextPopup(target, `QUEDA! -${h.fallDamage}`, 'fall');
-          }
-        }
-        if (h.lifesteal > 0) {
-          this.spawnUnitTextPopup(enemy, `+${h.lifesteal}`, 'heal');
+    } catch (err) {
+      console.error('[GameController] Error during skill/attack execution:', err);
+    } finally {
+      if (session === this.battleSessionId) {
+        this.isBusy = false;
+        this.busySinceMs = 0;
+        const outcome = this.engine.checkVictoryCondition();
+        if (outcome) {
+          this.handleBattleEnd(outcome);
+        } else {
+          this.syncPostActionState(active);
         }
       }
-      this.battlefield.syncFromEngine(this.engine);
     }
-
-    if (this.engine.combatEnded) {
-      this.handleBattleEnd(this.engine.combatEnded);
-      return;
-    }
-
-    this.engine.endTurn(decision.endFacing);
-    this.battlefield.syncFromEngine(this.engine);
-    await new Promise((r) => setTimeout(r, 260 / this.speedScale));
-    await this.advanceTurn();
   }
 
-  private handleBattleEnd(outcome: 'victory' | 'defeat'): void {
-    this.phase = 'ended';
+  private async confirmFacing(facing: Facing): Promise<void> {
+    if (this.isBusy || this.phase === 'ended') return;
+    const active = this.engine.getActiveUnit();
+    if (!active || active.team !== 'ally') return;
+    try {
+      this.audio.playUiConfirm();
+    } catch {
+      // Ignore audio errors when ending turn
+    }
+    this.skillsMenuOpen = false;
+    this.selectedSkill = null;
+    this.pendingTargetCell = null;
     this.battlefield.clearHighlights();
     this.battlefield.showFacingCompass(null);
     this.battlefield.setParabolicArc(null, null);
+    this.hideForecast();
+    this.engine.endUnitTurn(facing);
+    this.battlefield.syncFromEngine(this.engine);
+    this.renderCTBTimeline();
+    await this.advanceTurn();
+  }
+
+  private async executeEnemyTurn(enemy: BattleUnit, session: number): Promise<void> {
+    let endFacing: Facing = enemy.facing;
+    try {
+      this.busySinceMs = performance.now();
+      const decision = TacticalAI.chooseBestAction(this.engine, enemy);
+      endFacing = decision.endFacing;
+
+      if (decision.moveCol !== enemy.col || decision.moveRow !== enemy.row) {
+        await this.battlefield.animateUnitMovePath(enemy.id, decision.movePath, () => {
+          this.audio.playStep();
+        });
+        if (session !== this.battleSessionId) return;
+        this.engine.moveUnit(enemy, decision.moveCol, decision.moveRow);
+        this.battlefield.syncFromEngine(this.engine);
+      }
+
+      if (decision.skill) {
+        this.busySinceMs = performance.now();
+        this.battlefield.focusOnTile(decision.targetCol, decision.targetRow);
+        await this.showCastBanner(
+          `⚔️ ${enemy.name.toUpperCase()} CONJURA: ${decision.skill.name.toUpperCase()}!`,
+          1450
+        );
+        if (session !== this.battleSessionId) return;
+        const exec = this.engine.executeSkill(enemy, decision.skill, decision.targetCol, decision.targetRow);
+        this.audio.playSkillSfx(decision.skill);
+        await this.battlefield.animateUnitSkill(
+          enemy.id,
+          decision.skill,
+          decision.targetCol,
+          decision.targetRow,
+          exec.aoeTiles
+        );
+        if (session !== this.battleSessionId) return;
+
+        if (exec.telegraphedMeteor) {
+          void this.showCastBanner('🔥 CHÃO MARCADO! SAIA DA ÁREA EM 1 TURNO!', 1750);
+        }
+
+        for (const h of exec.hits) {
+          const target = this.engine.getUnit(h.targetId);
+          if (!target) continue;
+          if (h.isBlocked) {
+            this.audio.playShieldBlock();
+            this.battlefield.triggerHitFeedback(target.id, false, true, false);
+            this.spawnUnitTextPopup(target, 'BLOQUEADO!', 'block');
+          } else if (h.isEvaded) {
+            this.spawnUnitTextPopup(target, 'ESQUIVOU!', 'block');
+          } else if (h.healed > 0) {
+            this.spawnUnitTextPopup(target, `+${h.healed}`, 'heal');
+          } else if (h.damage > 0) {
+            if (h.isCrit) this.audio.playCriticalHit();
+            this.battlefield.triggerHitFeedback(target.id, h.isCrit, false, h.killed);
+            this.spawnUnitTextPopup(
+              target,
+              h.isCrit ? `CRÍTICO! -${h.damage}` : `-${h.damage}`,
+              h.isCrit ? 'crit' : 'normal'
+            );
+            if (h.fallDamage > 0) {
+              this.spawnUnitTextPopup(target, `QUEDA! -${h.fallDamage}`, 'fall');
+            }
+          }
+          if (h.lifesteal > 0) {
+            this.spawnUnitTextPopup(enemy, `+${h.lifesteal}`, 'heal');
+          }
+        }
+        this.battlefield.syncFromEngine(this.engine);
+      }
+    } catch (err) {
+      console.error('[GameController] Error during enemy turn:', err);
+    } finally {
+      if (session === this.battleSessionId) {
+        const outcome = this.engine.checkVictoryCondition();
+        if (outcome) {
+          this.handleBattleEnd(outcome);
+        } else {
+          if (this.engine.activeUnitId === enemy.id) {
+            this.engine.endUnitTurn(endFacing);
+            this.battlefield.syncFromEngine(this.engine);
+          }
+          await new Promise((r) => setTimeout(r, 260 / this.speedScale));
+        }
+      }
+    }
+  }
+
+  private handleBattleEnd(outcome: 'victory' | 'defeat'): void {
+    this.isBusy = false;
+    this.busySinceMs = 0;
+    this.phase = 'ended';
+    this.skillsMenuOpen = false;
+    this.selectedSkill = null;
+    this.pendingTargetCell = null;
+    this.battlefield.clearHighlights();
+    this.battlefield.showFacingCompass(null);
+    this.battlefield.setParabolicArc(null, null);
+    this.hideForecast();
+    this.skillsSubmenuEl.classList.add('hidden');
+    this.facingSubmenuEl.classList.add('hidden');
 
     const modal = document.getElementById('result-modal')!;
     const kicker = document.getElementById('result-kicker')!;
