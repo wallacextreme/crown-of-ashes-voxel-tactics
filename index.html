@@ -14,8 +14,8 @@
     <link rel="icon" type="image/svg+xml" href="./icon.svg" />
     <link rel="apple-touch-icon" href="./icon-192.png" />
     <title>CROWN OF ASHES: VOXEL TACTICS</title>
-    <script type="module" crossorigin src="./assets/index-CZB06ShB.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-DwLtKZTr.css">
+    <script type="module" crossorigin src="./assets/index-BDizx8QW.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DyCFcJdB.css">
   </head>
   <body>
     <canvas id="game-canvas"></canvas>
@@ -106,7 +106,7 @@
           <button id="cmd-move" class="cmd-btn"><span>🥾 MOVER</span><small>Alcance azul</small></button>
           <button id="cmd-attack" class="cmd-btn"><span>⚔️ ATACAR</span><small>Golpe básico</small></button>
           <button id="cmd-skills" class="cmd-btn"><span>✨ HABILIDADES</span><small>Classe &amp; Magia</small></button>
-          <button id="cmd-wait" class="cmd-btn"><span>🧭 ESPERAR / DIREÇÃO</span><small id="wait-ct-hint">+40 CT</small></button>
+          <button id="cmd-wait" class="cmd-btn"><span id="wait-btn-label">🧭 ESPERAR / DIREÇÃO</span><small id="wait-ct-hint">+40 CT</small></button>
         </div>
 
         <div id="skills-submenu" class="skills-submenu hidden">
@@ -120,7 +120,7 @@
         <div id="facing-submenu" class="facing-submenu hidden">
           <div class="submenu-header">
             <span class="facing-title">Direção do Olhar (Setas 3D ou abaixo)</span>
-            <button id="btn-close-facing" class="mini-close-btn" title="Fechar direção">✖</button>
+            <button id="btn-close-facing" class="mini-close-facing-btn mini-close-btn" title="Fechar direção">✖</button>
           </div>
           <div class="facing-grid">
             <button class="face-btn" data-facing="N">⬆️ NORTE</button>
@@ -128,6 +128,9 @@
             <button class="face-btn" data-facing="W">⬅️ OESTE</button>
             <button class="face-btn" data-facing="E">➡️ LESTE</button>
           </div>
+          <button id="btn-confirm-facing" class="hud-btn hud-btn-primary confirm-facing-btn">
+            ✅ CONFIRMAR DIREÇÃO / PASSAR VEZ
+          </button>
         </div>
       </div>
     </section>
