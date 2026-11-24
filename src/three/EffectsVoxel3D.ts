@@ -39,6 +39,15 @@ export class EffectsVoxel3D {
   private getFloorHeight: (wx: number, wz: number) => number;
   private triggerLight: PointLightPoolTrigger;
   private triggerEnvPulse?: EnvironmentPulseTrigger;
+  private tmpOffset = new THREE.Vector3();
+  private sharedRingOuterGeo = new THREE.RingGeometry(0.68, 0.82, 24);
+  private sharedRingInnerGeo = new THREE.RingGeometry(0.32, 0.42, 6);
+  private sharedSlashRibbonGeo = new THREE.RingGeometry(0.55, 0.96, 20, 1, 0, Math.PI * 1.05);
+  private sharedWindRingGeo = new THREE.RingGeometry(0.25, 0.55, 20);
+  private sharedShockwaveGeo = new THREE.RingGeometry(0.3, 0.7, 24);
+  private sharedGhostGeo = new THREE.BoxGeometry(0.5, 1.1, 0.4);
+  private sharedGeometries = new Set<THREE.BufferGeometry>();
+  private pooledRings: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial }[] = [];
 
   constructor(
     getFloorHeight: (wx: number, wz: number) => number,
@@ -52,11 +61,22 @@ export class EffectsVoxel3D {
     const cubeGeom = new THREE.BoxGeometry(0.10, 0.10, 0.10);
     const cubeMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      roughness: 0.35,
+      roughness: 0.3,
       metalness: 0.15,
-      emissive: 0x222222,
-      emissiveIntensity: 0.4,
+      emissive: 0x111111,
+      emissiveIntensity: 1.0,
     });
+    cubeMat.onBeforeCompile = (shader) => {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <emissivemap_fragment>',
+        `
+        #include <emissivemap_fragment>
+        #ifdef USE_INSTANCING_COLOR
+          totalEmissiveRadiance += vColor.rgb * 0.72;
+        #endif
+        `
+      );
+    };
     this.particleMesh = new THREE.InstancedMesh(cubeGeom, cubeMat, this.maxParticles);
     this.particleMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.particleMesh.frustumCulled = false;
@@ -78,6 +98,33 @@ export class EffectsVoxel3D {
       this.particleMesh.setColorAt(i, new THREE.Color(0xffffff));
     }
     this.group.add(this.particleMesh);
+    this.sharedGeometries.add(this.sharedRingOuterGeo);
+    this.sharedGeometries.add(this.sharedRingInnerGeo);
+    this.sharedGeometries.add(this.sharedSlashRibbonGeo);
+    this.sharedGeometries.add(this.sharedWindRingGeo);
+    this.sharedGeometries.add(this.sharedShockwaveGeo);
+    this.sharedGeometries.add(this.sharedGhostGeo);
+  }
+
+  private acquirePooledRing(colorHex: number, initialOpacity = 0.85): { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial } {
+    const existing = this.pooledRings.pop();
+    if (existing) {
+      existing.mat.color.setHex(colorHex).multiplyScalar(1.65);
+      existing.mat.opacity = initialOpacity;
+      existing.mesh.scale.setScalar(1);
+      existing.mesh.rotation.set(-Math.PI / 2, 0, 0);
+      return existing;
+    }
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(colorHex).multiplyScalar(1.65),
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: initialOpacity,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(this.sharedShockwaveGeo, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    return { mesh, mat };
   }
 
   spawnVoxelBurst(
@@ -93,13 +140,12 @@ export class EffectsVoxel3D {
       const p = this.particles[i];
       if (p.active) continue;
       p.active = true;
-      p.pos.copy(origin).add(
-        new THREE.Vector3(
-          (Math.random() - 0.5) * 0.45,
-          Math.random() * 0.45 + 0.15,
-          (Math.random() - 0.5) * 0.45
-        )
+      this.tmpOffset.set(
+        (Math.random() - 0.5) * 0.45,
+        Math.random() * 0.45 + 0.15,
+        (Math.random() - 0.5) * 0.45
       );
+      p.pos.copy(origin).add(this.tmpOffset);
       const angle = Math.random() * Math.PI * 2;
       const spd = (0.35 + Math.random() * 0.9) * speed;
       p.vel.set(
@@ -137,15 +183,15 @@ export class EffectsVoxel3D {
   spawnCasterMagicCircle(casterPos: THREE.Vector3, colorHex: number): void {
     const g = new THREE.Group();
     const mat = new THREE.MeshBasicMaterial({
-      color: colorHex,
+      color: new THREE.Color(colorHex).multiplyScalar(1.75),
       side: THREE.DoubleSide,
       transparent: true,
       opacity: 0.92,
       depthWrite: false,
     });
-    const outer = new THREE.Mesh(new THREE.RingGeometry(0.68, 0.82, 24), mat);
+    const outer = new THREE.Mesh(this.sharedRingOuterGeo, mat);
     outer.rotation.x = -Math.PI / 2;
-    const inner = new THREE.Mesh(new THREE.RingGeometry(0.32, 0.42, 6), mat);
+    const inner = new THREE.Mesh(this.sharedRingInnerGeo, mat);
     inner.rotation.x = -Math.PI / 2;
     g.add(outer, inner);
     g.position.set(casterPos.x, casterPos.y + 0.06, casterPos.z);
@@ -174,7 +220,7 @@ export class EffectsVoxel3D {
         opacity: 0.96,
         depthWrite: false,
       });
-      const ribbon = new THREE.Mesh(new THREE.RingGeometry(0.55, 0.96, 20, 1, 0, Math.PI * 1.05), mat);
+      const ribbon = new THREE.Mesh(this.sharedSlashRibbonGeo, mat);
       ribbon.position.set(center.x, center.y + 0.85, center.z);
       ribbon.rotation.set(tiltX, yaw, tiltZ);
       this.addTransient(ribbon, 0.30, (t) => {
@@ -200,7 +246,7 @@ export class EffectsVoxel3D {
       opacity: 0.85,
       depthWrite: false,
     });
-    const ring = new THREE.Mesh(new THREE.RingGeometry(0.25, 0.55, 20), mat);
+    const ring = new THREE.Mesh(this.sharedWindRingGeo, mat);
     ring.rotation.x = -Math.PI / 2;
     ring.position.set(origin.x, origin.y + 0.08, origin.z);
     this.addTransient(ring, 0.35, (t) => {
@@ -232,14 +278,14 @@ export class EffectsVoxel3D {
 
     switch (skill.vfxType) {
       case 'judgment_blade': {
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.8, 0)), 0x38bdf8, 12, 0.8);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.8, 0)), 0x38bdf8, 18, 0.85);
         for (let idx = 0; idx < aoePositions.length; idx++) {
           const p = aoePositions[idx];
           const g = new THREE.Group();
           const swordMat = new THREE.MeshStandardMaterial({
             color: 0xe0f2fe,
             emissive: idx % 2 === 0 ? 0x38bdf8 : 0xfde047,
-            emissiveIntensity: 2.7,
+            emissiveIntensity: 3.1,
             transparent: true,
             opacity: 0.94,
           });
@@ -282,7 +328,7 @@ export class EffectsVoxel3D {
       case 'thundaga': {
         this.triggerEnvPulse?.('storm_dark', 260);
         const boltColor = skill.vfxType === 'hallowed_bolt' ? 0xfef08a : 0x60a5fa;
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 2, 0)), boltColor, 14, 0.55);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 2, 0)), boltColor, 22, 0.62);
         for (const p of aoePositions) {
           const g = new THREE.Group();
           const mat = new THREE.MeshStandardMaterial({
@@ -328,7 +374,7 @@ export class EffectsVoxel3D {
 
       case 'firaga':
       case 'dragon_breath': {
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.4, 0)), 0xf97316, 14, 0.8);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.4, 0)), 0xf97316, 22, 0.85);
         // Descending solar plasma sphere at center
         const orbMat = new THREE.MeshStandardMaterial({
           color: 0xfef08a,
@@ -381,14 +427,14 @@ export class EffectsVoxel3D {
       }
 
       case 'blizzaga': {
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.2, 0)), 0x38bdf8, 11, 0.72);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.2, 0)), 0x38bdf8, 18, 0.78);
         for (let idx = 0; idx < aoePositions.length; idx++) {
           const p = aoePositions[idx];
           const g = new THREE.Group();
           const iceMat = new THREE.MeshPhysicalMaterial({
             color: 0xe0f2fe,
             emissive: 0x0ea5e9,
-            emissiveIntensity: 1.85,
+            emissiveIntensity: 2.35,
             roughness: 0.14,
             metalness: 0.2,
             clearcoat: 0.9,
@@ -474,6 +520,7 @@ export class EffectsVoxel3D {
         const start = attackerPos.clone().add(new THREE.Vector3(0, 1.0, 0));
         const end = targetPos.clone().add(new THREE.Vector3(0, 0.8, 0));
         proj.position.copy(start);
+        this.triggerLight(end, col, 10, 0.4);
         this.addTransient(proj, 0.34, (t) => {
           const arcY = Math.sin(t * Math.PI) * 1.45;
           proj.position.lerpVectors(start, end, t);
@@ -566,11 +613,11 @@ export class EffectsVoxel3D {
       }
 
       case 'holy': {
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.5, 0)), 0xfef08a, 16, 0.75);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1.5, 0)), 0xfef08a, 26, 0.82);
         const orbMat = new THREE.MeshStandardMaterial({
           color: 0xffffff,
           emissive: 0xfde047,
-          emissiveIntensity: 3.0,
+          emissiveIntensity: 3.4,
           transparent: true,
           opacity: 0.95,
         });
@@ -586,14 +633,14 @@ export class EffectsVoxel3D {
       }
 
       case 'shadow_step': {
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1, 0)), 0xa855f7, 11, 0.55);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 1, 0)), 0xa855f7, 17, 0.6);
         // Ghostly afterimage at origin
         const ghostMat = new THREE.MeshBasicMaterial({
-          color: 0xa855f7,
+          color: new THREE.Color(0xa855f7).multiplyScalar(1.65),
           transparent: true,
-          opacity: 0.65,
+          opacity: 0.72,
         });
-        const ghost = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.1, 0.4), ghostMat);
+        const ghost = new THREE.Mesh(this.sharedGhostGeo, ghostMat);
         ghost.position.set(attackerPos.x, attackerPos.y + 0.65, attackerPos.z);
         this.addTransient(ghost, 0.45, (t) => {
           ghostMat.opacity = 0.65 * (1 - t);
@@ -608,17 +655,17 @@ export class EffectsVoxel3D {
 
       case 'apocalypse_meteor': {
         this.triggerEnvPulse?.('blood_sky', 950);
-        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 2.5, 0)), 0xff4500, 18, 0.95);
+        this.triggerLight(targetPos.clone().add(new THREE.Vector3(0, 2.5, 0)), 0xff4500, 28, 1.0);
         const g = new THREE.Group();
         const meteorMat = new THREE.MeshStandardMaterial({
           color: 0x450a0a,
           emissive: 0xff5500,
-          emissiveIntensity: 2.8,
+          emissiveIntensity: 3.5,
           roughness: 0.5,
         });
         const meteor = new THREE.Mesh(new THREE.DodecahedronGeometry(1.1, 1), meteorMat);
         const fireRingMat = new THREE.MeshBasicMaterial({
-          color: 0xfef08a,
+          color: new THREE.Color(0xfef08a).multiplyScalar(1.75),
           side: THREE.DoubleSide,
           transparent: true,
           opacity: 0.9,
@@ -640,16 +687,12 @@ export class EffectsVoxel3D {
           if (t > 0.85) g.scale.setScalar(1 + (t - 0.85) * 6);
         });
 
-        // Double ground shockwave
+        // Double ground shockwave (pooled ring meshes)
         for (const scaleTarget of [2.5, 4.2]) {
-          const swMat = new THREE.MeshBasicMaterial({
-            color: 0xff5500,
-            side: THREE.DoubleSide,
-            transparent: true,
-            opacity: 0.85,
-          });
-          const sw = new THREE.Mesh(new THREE.RingGeometry(0.3, 0.7, 24), swMat);
-          sw.rotation.x = -Math.PI / 2;
+          const pooled = this.acquirePooledRing(0xff5500, 0.85);
+          const sw = pooled.mesh;
+          const swMat = pooled.mat;
+          sw.userData.__pooledRing = pooled;
           sw.position.set(targetPos.x, targetPos.y + 0.1, targetPos.z);
           this.addTransient(sw, 0.85, (t) => {
             sw.scale.setScalar(1 + t * scaleTarget);
@@ -728,17 +771,26 @@ export class EffectsVoxel3D {
       fx.update(t, dt);
       if (fx.life >= fx.maxLife) {
         this.group.remove(fx.mesh);
-        fx.mesh.traverse((o) => {
-          if ((o as THREE.Mesh).isMesh) {
-            const m = o as THREE.Mesh;
-            m.geometry?.dispose();
-            if (Array.isArray(m.material)) {
-              m.material.forEach((mat) => mat.dispose());
-            } else {
-              m.material?.dispose();
+        const pooledRing = fx.mesh.userData?.__pooledRing as
+          | { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial }
+          | undefined;
+        if (pooledRing && this.pooledRings.length < 32) {
+          this.pooledRings.push(pooledRing);
+        } else {
+          fx.mesh.traverse((o) => {
+            if ((o as THREE.Mesh).isMesh) {
+              const m = o as THREE.Mesh;
+              if (m.geometry && !this.sharedGeometries.has(m.geometry)) {
+                m.geometry.dispose();
+              }
+              if (Array.isArray(m.material)) {
+                m.material.forEach((mat) => mat.dispose());
+              } else {
+                m.material?.dispose();
+              }
             }
-          }
-        });
+          });
+        }
         this.transientEffects.splice(i, 1);
       }
     }

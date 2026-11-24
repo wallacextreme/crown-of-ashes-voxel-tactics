@@ -103,6 +103,12 @@ class GameController {
       () => this.refreshHudHeader()
     );
 
+    const params = new URLSearchParams(window.location.search);
+    const paramPreset = params.get('preset');
+    if (paramPreset === 'LOW' || paramPreset === 'MEDIUM' || paramPreset === 'HIGH') {
+      this.battlefield.setGraphicsPreset(paramPreset);
+    }
+
     this.graphicsPreset = this.battlefield.getGraphicsPreset();
     const graphicsBtnInit = document.getElementById('btn-graphics');
     if (graphicsBtnInit) {
@@ -122,7 +128,21 @@ class GameController {
     }
     window.addEventListener('resize', () => this.syncHudHeightVar());
     window.addEventListener('orientationchange', () => this.syncHudHeightVar());
-    this.startStage(this.campaign.getData().selectedStageId || 1);
+
+    const existingDebug = (window as unknown as { __coaDebug?: Record<string, unknown> }).__coaDebug ?? {};
+    existingDebug.loadStageById = (id: number) => this.startStage(id);
+    (window as unknown as { __coaDebug: Record<string, unknown> }).__coaDebug = existingDebug;
+
+    if (params.get('hideHud') === '1') {
+      this.setHudHidden(true);
+    }
+
+    const stageParam = Number(params.get('stage'));
+    const initialStage =
+      Number.isInteger(stageParam) && stageParam >= 1 && stageParam <= 5
+        ? stageParam
+        : this.campaign.getData().selectedStageId || 1;
+    this.startStage(initialStage);
   }
 
   private setBusy(busy: boolean): void {

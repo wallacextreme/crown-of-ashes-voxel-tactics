@@ -1,5 +1,11 @@
 import * as THREE from 'three';
+import type { GLTF } from 'three/addons/loaders/GLTFLoader.js';
 import type { GridTile, PropType, StageDef, SurfaceType } from '../types/tactics.ts';
+import {
+  type DioramaGLBAssets,
+  resolveColumnKeysForBiome,
+  resolvePropAssetKey,
+} from './AssetLoader3D.ts';
 import { getVoxelPBRMaterial } from './ProceduralVoxelPBR.ts';
 import { type MicroVoxel, buildMergedVoxelMesh } from './VoxelEngine3D.ts';
 
@@ -93,14 +99,18 @@ function createLiquidShaderMaterial(
       void main() {
         vUv = uv;
         vec3 pos = position;
-        vec4 wp = modelMatrix * vec4(pos, 1.0);
-        float speed = uMode == 1.0 ? 1.5 : (uMode == 3.0 ? 4.2 : 2.6);
-        float amp = uMode == 1.0 ? 0.045 : 0.06;
+        vec4 localPos = vec4(pos, 1.0);
+        #ifdef USE_INSTANCING
+          localPos = instanceMatrix * localPos;
+        #endif
+        vec4 wp = modelMatrix * localPos;
+        float speed = uMode == 1.0 ? 1.4 : (uMode == 3.0 ? 4.4 : 2.5);
+        float amp = uMode == 1.0 ? 0.048 : 0.062;
         float flow = uMode == 3.0 ? wp.z * 2.8 - uTime * speed : wp.x * 2.2 + uTime * speed;
         float wave = sin(flow) * cos(wp.z * 2.1 - uTime * speed * 0.7) * amp;
-        pos.y += wave;
+        localPos.y += wave;
         vWave = wave;
-        vec4 finalWp = modelMatrix * vec4(pos, 1.0);
+        vec4 finalWp = modelMatrix * localPos;
         vWorldPos = finalWp.xyz;
         gl_Position = projectionMatrix * viewMatrix * finalWp;
       }
@@ -115,38 +125,42 @@ function createLiquidShaderMaterial(
 
       void main() {
         float edgeDist = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
-        float edgeFoam = 1.0 - smoothstep(0.02, 0.16, edgeDist);
+        float edgeFoam = 1.0 - smoothstep(0.015, 0.18, edgeDist);
 
         if (uMode == 1.0) {
-          float n1 = sin(vWorldPos.x * 3.1 + uTime * 1.2) * cos(vWorldPos.z * 2.7 - uTime * 0.9);
-          float n2 = sin((vWorldPos.x + vWorldPos.z) * 4.5 - uTime * 1.6);
-          float magma = clamp(0.5 + 0.35 * n1 + 0.25 * n2 + vWave * 4.0, 0.0, 1.0);
-          vec3 crust = vec3(0.18, 0.04, 0.03);
-          vec3 orange = vec3(1.15, 0.34, 0.04);
-          vec3 bright = vec3(1.90, 1.05, 0.22);
-          vec3 col = mix(crust, orange, smoothstep(0.25, 0.68, magma));
-          col = mix(col, bright, smoothstep(0.68, 0.96, magma));
-          col += vec3(0.95, 0.45, 0.1) * edgeFoam * 0.65;
+          float n1 = sin(vWorldPos.x * 3.1 + uTime * 1.15) * cos(vWorldPos.z * 2.7 - uTime * 0.85);
+          float n2 = sin((vWorldPos.x - vWorldPos.z) * 4.4 - uTime * 1.55);
+          float n3 = cos(vWorldPos.x * 6.3 + vWorldPos.z * 5.8 + uTime * 0.9);
+          float magma = clamp(0.48 + 0.32 * n1 + 0.24 * n2 + 0.14 * n3 + vWave * 4.0, 0.0, 1.0);
+          vec3 crust = vec3(0.11, 0.025, 0.02);
+          vec3 orange = vec3(1.25, 0.34, 0.04);
+          vec3 bright = vec3(2.20, 1.18, 0.28);
+          vec3 col = mix(crust, orange, smoothstep(0.28, 0.66, magma));
+          col = mix(col, bright, smoothstep(0.66, 0.95, magma));
+          col += vec3(1.15, 0.45, 0.10) * edgeFoam * 0.22;
           gl_FragColor = vec4(col, 1.0);
         } else if (uMode == 2.0) {
-          float murk = sin(vWorldPos.x * 2.8 + uTime * 1.4) * cos(vWorldPos.z * 3.2 - uTime * 1.1);
-          vec3 deepSwamp = vec3(0.08, 0.20, 0.12);
-          vec3 toxic = vec3(0.24, 0.45, 0.16);
-          vec3 ether = vec3(0.45, 0.22, 0.62);
+          float murk = sin(vWorldPos.x * 2.8 + uTime * 1.35) * cos(vWorldPos.z * 3.2 - uTime * 1.05);
+          float swirl = sin(vWorldPos.x * 5.2 - vWorldPos.z * 4.6 + uTime * 1.8);
+          vec3 deepSwamp = vec3(0.06, 0.18, 0.11);
+          vec3 toxic = vec3(0.22, 0.48, 0.16);
+          vec3 ether = vec3(0.55, 0.26, 0.78);
           vec3 col = mix(deepSwamp, toxic, 0.5 + 0.5 * murk);
-          col = mix(col, ether, smoothstep(0.6, 0.95, sin(vWorldPos.x * 1.9 - uTime * 0.8)) * 0.45);
-          col += vec3(0.45, 0.78, 0.35) * edgeFoam * 0.4;
+          col = mix(col, ether, smoothstep(0.52, 0.94, swirl) * 0.55);
+          col += vec3(0.48, 0.88, 0.38) * edgeFoam * 0.18;
           gl_FragColor = vec4(col, 0.92);
         } else {
-          float flow = uMode == 3.0 ? (vWorldPos.z * 3.8 - uTime * 4.5) : (vWorldPos.x * 4.0 + uTime * 2.3);
+          float flow = uMode == 3.0 ? (vWorldPos.z * 3.8 - uTime * 4.6) : (vWorldPos.x * 4.0 + uTime * 2.3);
           float ripple = sin(flow) * cos(vWorldPos.x * 3.2 - uTime * 2.0);
-          float spec = smoothstep(0.48, 0.94, ripple + vWave * 8.0);
-          vec3 deepWater = vec3(0.03, 0.24, 0.44);
-          vec3 shallowWater = uMode == 3.0 ? vec3(0.12, 0.58, 0.84) : vec3(0.07, 0.48, 0.72);
+          float caustic = smoothstep(0.35, 0.92, sin(vWorldPos.x * 5.4 + uTime * 1.9) * sin(vWorldPos.z * 5.1 - uTime * 2.1));
+          float spec = smoothstep(0.45, 0.92, ripple + vWave * 8.0);
+          vec3 deepWater = vec3(0.03, 0.22, 0.42);
+          vec3 shallowWater = uMode == 3.0 ? vec3(0.11, 0.58, 0.86) : vec3(0.07, 0.48, 0.75);
           vec3 col = mix(deepWater, shallowWater, 0.5 + 0.5 * ripple);
-          col += vec3(0.65, 0.92, 1.0) * spec * (uMode == 3.0 ? 0.52 : 0.32);
-          col = mix(col, vec3(0.86, 0.96, 1.0), edgeFoam * (uMode == 3.0 ? 0.82 : 0.62));
-          gl_FragColor = vec4(col, 0.88);
+          col += vec3(0.35, 0.78, 0.96) * caustic * 0.28;
+          col += vec3(0.75, 0.95, 1.05) * spec * (uMode == 3.0 ? 0.56 : 0.38);
+          col = mix(col, vec3(0.92, 0.98, 1.05), edgeFoam * (uMode == 3.0 ? 0.28 : 0.24));
+          gl_FragColor = vec4(col, 0.86);
         }
       }
     `,
@@ -178,7 +192,6 @@ function buildPropVoxels(prop: PropType, biome: StageDef['biome']): MicroVoxel[]
   switch (prop) {
     case 'tree': {
       if (biome === 'swamp') {
-        // Twisted dead gnarled swamp tree + hanging moss
         add(-2, 0, -2, 2, 1, 2, 0x3b2f2f, 'leather');
         add(-1, 2, -1, 1, 7, 1, 0x44403c, 'leather');
         add(-4, 7, -1, -1, 9, 1, 0x44403c, 'leather');
@@ -186,7 +199,6 @@ function buildPropVoxels(prop: PropType, biome: StageDef['biome']): MicroVoxel[]
         add(-4, 5, 0, -4, 6, 0, 0x4d7c0f, 'cloth');
         add(4, 6, 0, 4, 7, 0, 0x4d7c0f, 'cloth');
       } else {
-        // Robust oak trunk with visible roots + multi-tiered foliage
         add(-3, 0, -1, 3, 1, 1, 0x5c3a21, 'leather');
         add(-1, 0, -3, 1, 1, 3, 0x5c3a21, 'leather');
         add(-1, 2, -1, 1, 7, 1, 0x78350f, 'leather');
@@ -201,7 +213,7 @@ function buildPropVoxels(prop: PropType, biome: StageDef['biome']): MicroVoxel[]
       add(-5, 4, -5, 5, 6, 5, 0x14532d, 'cloth');
       add(-4, 7, -4, 4, 9, 4, 0x166534, 'cloth');
       add(-3, 10, -3, 3, 12, 3, 0x15803d, 'cloth');
-      add(-2, 13, -2, 2, 14, 2, 0xb8c4d4, 'cloth'); // Snow cap
+      add(-2, 13, -2, 2, 14, 2, 0xb8c4d4, 'cloth');
       add(-1, 15, -1, 1, 16, 1, 0xcbd5e1, 'cloth');
       break;
     }
@@ -213,24 +225,22 @@ function buildPropVoxels(prop: PropType, biome: StageDef['biome']): MicroVoxel[]
       add(-1, 3, -1, 1, 13, 1, col, 'stone');
       add(-2, 14, -2, 2, 15, 2, top, mat);
       if (biome === 'forest') {
-        add(-2, 4, 2, -1, 6, 2, 0x4d7c0f, 'cloth'); // Moss patch
+        add(-2, 4, 2, -1, 6, 2, 0x4d7c0f, 'cloth');
       }
       break;
     }
     case 'ruin_wall': {
       if (biome === 'forest') {
-        // Broken Gothic Abbey arch + moss
         add(-5, 0, -2, -3, 11, 2, 0x57534e, 'stone');
         add(3, 0, -2, 5, 8, 2, 0x57534e, 'stone');
         add(-4, 11, -2, 2, 13, 2, 0x6b6661, 'stone');
         add(-4, 4, 2, -2, 7, 2, 0x4d7c0f, 'cloth');
       } else if (biome === 'arctic') {
-        // Frozen castle battlement with iron portcullis look
         add(-5, 0, -2, 5, 9, 2, 0x64748b, 'stone');
         add(-5, 10, -2, -3, 12, 2, 0x94a3b8, 'stone');
         add(-1, 10, -2, 1, 12, 2, 0x94a3b8, 'stone');
         add(3, 10, -2, 5, 12, 2, 0x94a3b8, 'stone');
-        add(-5, 13, -2, -3, 13, 2, 0xb8c4d4, 'cloth'); // Snow on merlons
+        add(-5, 13, -2, -3, 13, 2, 0xb8c4d4, 'cloth');
       } else {
         add(-5, 0, -2, 5, 8, 2, 0x44403c, 'stone');
         add(-5, 9, -2, -2, 11, 2, 0x57534e, 'stone');
@@ -323,25 +333,139 @@ interface AmbientMote {
   scale: number;
 }
 
+interface ChestHandle {
+  group: THREE.Object3D;
+  isGLTF: boolean;
+  lid?: THREE.Object3D;
+  opened: boolean;
+}
+
+interface InstanceBatchItem {
+  matrix: THREE.Matrix4;
+  tintHex?: number;
+}
+
+function computeStairYaw(
+  tile: GridTile,
+  tiles: Map<string, GridTile>
+): number {
+  const dirs: { dc: number; dr: number; yaw: number }[] = [
+    { dc: 0, dr: -1, yaw: 0 }, // High toward North (-Z)
+    { dc: 0, dr: 1, yaw: Math.PI }, // High toward South (+Z)
+    { dc: -1, dr: 0, yaw: Math.PI / 2 }, // High toward West (-X)
+    { dc: 1, dr: 0, yaw: -Math.PI / 2 }, // High toward East (+X)
+  ];
+
+  let bestHigherYaw: number | null = null;
+  let bestHigherDelta = 0;
+  let bestLowerOppositeYaw: number | null = null;
+  let bestLowerDelta = 0;
+
+  for (const d of dirs) {
+    const nb = tiles.get(`${tile.col + d.dc},${tile.row + d.dr}`);
+    if (!nb) continue;
+    const diff = nb.height - tile.height;
+    if (diff > bestHigherDelta) {
+      bestHigherDelta = diff;
+      bestHigherYaw = d.yaw;
+    }
+    if (diff < bestLowerDelta) {
+      bestLowerDelta = diff;
+      bestLowerOppositeYaw = d.yaw + Math.PI;
+    }
+  }
+
+  return bestHigherYaw ?? bestLowerOppositeYaw ?? 0;
+}
+
+function getPropBiomeTint(prop: PropType, biome: StageDef['biome']): number | undefined {
+  if (prop === 'rock' && biome === 'canyon') return 0xe7a283;
+  if (prop === 'rock' && biome === 'arctic') return 0xdbeafe;
+  if (prop === 'pillar' && biome === 'volcanic') return 0x6b6470;
+  if (prop === 'banner' && biome === 'volcanic') return 0xffb3a7;
+  if (prop === 'crystal' && biome === 'volcanic') return 0xff708a;
+  if (prop === 'crystal' && biome === 'swamp') return 0xd8b4fe;
+  return undefined;
+}
+
 export class TerrainDioramaVoxel3D {
   group = new THREE.Group();
   tileHitMeshes: THREE.Mesh[] = [];
-  chestMeshes = new Map<string, THREE.Group>();
+  chestMeshes = new Map<string, ChestHandle>();
   liquidMaterials: THREE.ShaderMaterial[] = [];
   floatingCrystals: THREE.Object3D[] = [];
 
+  private flickerEmissiveMaterials: THREE.MeshStandardMaterial[] = [];
+  private clonedMaterialsToDispose: THREE.Material[] = [];
+  private proceduralGeomsToDispose: THREE.BufferGeometry[] = [];
   private ambientMesh: THREE.InstancedMesh | null = null;
   private ambientMotes: AmbientMote[] = [];
   private maxAmbient = 140;
   private densityRatio = 1.0;
   private dummy = new THREE.Object3D();
   private stage: StageDef;
+  private assets?: DioramaGLBAssets;
 
-  constructor(stage: StageDef, tiles: Map<string, GridTile>) {
+  constructor(stage: StageDef, tiles: Map<string, GridTile>, assets?: DioramaGLBAssets) {
     this.stage = stage;
+    this.assets = assets;
     this.buildDioramaGeometry(stage, tiles);
     this.buildBiomeArchitecture(stage);
     this.buildAmbientParticles(stage);
+  }
+
+  private emitGLTFInstancedBatch(gltf: GLTF, items: InstanceBatchItem[], registerFlicker = false): void {
+    if (items.length === 0) return;
+
+    gltf.scene.updateMatrixWorld(true);
+    const meshes: THREE.Mesh[] = [];
+    gltf.scene.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        meshes.push(obj as THREE.Mesh);
+      }
+    });
+
+    const tmpWorld = new THREE.Matrix4();
+    const tmpColor = new THREE.Color();
+
+    for (const srcMesh of meshes) {
+      const srcMats = Array.isArray(srcMesh.material) ? srcMesh.material : [srcMesh.material];
+      const baseMat = srcMats[0];
+      if (!baseMat) continue;
+
+      const mat = baseMat.clone();
+      const matName = (mat.name || '').toLowerCase();
+      const isEmissive = matName.startsWith('emissive');
+      if (isEmissive && (mat as THREE.MeshStandardMaterial).isMeshStandardMaterial) {
+        const stdMat = mat as THREE.MeshStandardMaterial;
+        stdMat.emissiveIntensity = Math.max(stdMat.emissiveIntensity || 1.0, 2.2);
+        if (registerFlicker) {
+          this.flickerEmissiveMaterials.push(stdMat);
+        }
+      }
+      this.clonedMaterialsToDispose.push(mat);
+
+      srcMesh.geometry.userData.sharedGLTF = true;
+      const im = new THREE.InstancedMesh(srcMesh.geometry, mat, items.length);
+      im.castShadow = !isEmissive;
+      im.receiveShadow = true;
+
+      let hasColors = false;
+      for (let i = 0; i < items.length; i++) {
+        tmpWorld.multiplyMatrices(items[i].matrix, srcMesh.matrixWorld);
+        im.setMatrixAt(i, tmpWorld);
+        if (items[i].tintHex !== undefined) {
+          tmpColor.setHex(items[i].tintHex!);
+          im.setColorAt(i, tmpColor);
+          hasColors = true;
+        }
+      }
+      im.instanceMatrix.needsUpdate = true;
+      if (hasColors && im.instanceColor) {
+        im.instanceColor.needsUpdate = true;
+      }
+      this.group.add(im);
+    }
   }
 
   private buildDioramaGeometry(stage: StageDef, tiles: Map<string, GridTile>): void {
@@ -400,7 +524,9 @@ export class TerrainDioramaVoxel3D {
     };
 
     const hitGeom = new THREE.BoxGeometry(TILE_SIZE * 0.96, 0.14, TILE_SIZE * 0.96);
+    this.proceduralGeomsToDispose.push(hitGeom);
     const hitMat = new THREE.MeshBasicMaterial({ visible: false });
+    this.clonedMaterialsToDispose.push(hitMat);
 
     const waterTiles: GridTile[] = [];
     const lavaTiles: GridTile[] = [];
@@ -427,7 +553,35 @@ export class TerrainDioramaVoxel3D {
       }
     }
 
+    const colKeys = resolveColumnKeysForBiome(stage.biome);
+    const primaryColGLTF =
+      this.assets?.terrain.get(colKeys.primary) ?? this.assets?.terrain.get('column_stone');
+    const earthColGLTF =
+      this.assets?.terrain.get(colKeys.earth) ?? this.assets?.terrain.get('column_earth') ?? primaryColGLTF;
+
+    const terrainBatches = new Map<string, { gltf: GLTF; items: InstanceBatchItem[] }>();
+    const propBatches = new Map<string, { gltf: GLTF; items: InstanceBatchItem[]; flicker: boolean }>();
+
+    const pushTerrainBatch = (key: string, gltf: GLTF, item: InstanceBatchItem) => {
+      let b = terrainBatches.get(key);
+      if (!b) {
+        b = { gltf, items: [] };
+        terrainBatches.set(key, b);
+      }
+      b.items.push(item);
+    };
+
+    const pushPropBatch = (key: string, gltf: GLTF, item: InstanceBatchItem, flicker: boolean) => {
+      let b = propBatches.get(key);
+      if (!b) {
+        b = { gltf, items: [], flicker };
+        propBatches.set(key, b);
+      }
+      b.items.push(item);
+    };
+
     const flowerCoords: THREE.Vector3[] = [];
+    const tmpObj = new THREE.Object3D();
 
     for (const tile of tiles.values()) {
       const center = tileCenterWorld(tile.col, tile.row, tile.height, stage.cols, stage.rows);
@@ -450,77 +604,256 @@ export class TerrainDioramaVoxel3D {
         lavaTiles.push(tile);
         pushBox(center.x, -0.2, center.z, TILE_SIZE * 0.99, 0.35, TILE_SIZE * 0.99, 0x1c1917);
       } else if (tile.isBridge) {
-        const deckY = center.y - 0.14;
-        pushBox(center.x, deckY, center.z, TILE_SIZE * 0.98, 0.28, TILE_SIZE * 0.98, topHex, 1.04);
-        if ((tile.col + tile.row) % 2 === 0) {
-          pushBox(center.x, deckY * 0.5, center.z, 0.34, deckY, 0.34, pal.deep);
-        }
-        // Canyon suspension bridge posts & chains
-        if (stage.biome === 'canyon') {
-          pushBox(center.x - TILE_SIZE * 0.42, center.y + 0.35, center.z - TILE_SIZE * 0.42, 0.14, 0.7, 0.14, 0x57534e);
-          pushBox(center.x + TILE_SIZE * 0.42, center.y + 0.35, center.z + TILE_SIZE * 0.42, 0.14, 0.7, 0.14, 0x57534e);
+        const bridgeKey = stage.biome === 'canyon' ? 'bridge_stone' : 'bridge_wood';
+        const bridgeGLTF =
+          this.assets?.terrain.get(bridgeKey) ?? this.assets?.terrain.get('bridge_wood');
+
+        if (bridgeGLTF) {
+          tmpObj.position.set(center.x, center.y, center.z);
+          tmpObj.rotation.set(0, stage.biome === 'canyon' ? Math.PI / 2 : 0, 0);
+          tmpObj.scale.set(1, 1, 1);
+          tmpObj.updateMatrix();
+          pushTerrainBatch(bridgeKey, bridgeGLTF, { matrix: tmpObj.matrix.clone() });
+
+          if ((tile.col + tile.row) % 2 === 0 && primaryColGLTF) {
+            const pierH = Math.max(0.2, center.y - 0.24);
+            tmpObj.position.set(center.x, center.y - 0.24, center.z);
+            tmpObj.rotation.set(0, 0, 0);
+            tmpObj.scale.set(0.28, pierH, 0.28);
+            tmpObj.updateMatrix();
+            pushTerrainBatch('__pier', primaryColGLTF, { matrix: tmpObj.matrix.clone() });
+          }
+          if (stage.biome === 'canyon' && (tile.row === 4 || tile.row === 7)) {
+            const zSign = tile.row === 4 ? -1 : 1;
+            pushBox(center.x, center.y + 0.32, center.z + zSign * TILE_SIZE * 0.42, 0.18, 0.64, 0.16, 0x7c3a23);
+          }
+        } else {
+          const deckY = center.y - 0.14;
+          pushBox(center.x, deckY, center.z, TILE_SIZE * 0.98, 0.28, TILE_SIZE * 0.98, topHex, 1.04);
+          if ((tile.col + tile.row) % 2 === 0) {
+            pushBox(center.x, deckY * 0.5, center.z, 0.34, deckY, 0.34, pal.deep);
+          }
+          if (stage.biome === 'canyon' && (tile.row === 4 || tile.row === 7)) {
+            const zSign = tile.row === 4 ? -1 : 1;
+            pushBox(center.x, center.y + 0.32, center.z + zSign * TILE_SIZE * 0.42, 0.18, 0.64, 0.16, 0x7c3a23);
+          }
         }
       } else if (tile.isStair) {
+        const stairKey = tile.surface === 'metal' ? 'stair_metal' : 'stair_stone';
+        const stairGLTF =
+          this.assets?.terrain.get(stairKey) ?? this.assets?.terrain.get('stair_stone');
         const totalH = tile.height * STEP_HEIGHT;
-        const basePartH = Math.max(0.2, totalH - STEP_HEIGHT);
-        pushBox(center.x, basePartH * 0.5, center.z, TILE_SIZE * 0.96, basePartH, TILE_SIZE * 0.96, pal.side);
-        for (let s = 0; s < 3; s++) {
-          const stepY = basePartH + ((s + 0.5) / 3) * STEP_HEIGHT;
-          const stepSize = TILE_SIZE * (0.94 - s * 0.24);
-          pushBox(center.x, stepY, center.z, stepSize, STEP_HEIGHT / 3, stepSize, topHex, 1.0 + s * 0.03);
+        const basePartH = Math.max(0.1, totalH - STEP_HEIGHT);
+
+        if (stairGLTF) {
+          const yaw = computeStairYaw(tile, tiles);
+          tmpObj.position.set(center.x, center.y, center.z);
+          tmpObj.rotation.set(0, yaw, 0);
+          tmpObj.scale.set(1, 1, 1);
+          tmpObj.updateMatrix();
+          pushTerrainBatch(stairKey, stairGLTF, { matrix: tmpObj.matrix.clone() });
+
+          if (primaryColGLTF && basePartH > 0.05) {
+            tmpObj.position.set(center.x, basePartH, center.z);
+            tmpObj.rotation.set(0, 0, 0);
+            tmpObj.scale.set(1, basePartH + 0.12, 1);
+            tmpObj.updateMatrix();
+            pushTerrainBatch('__col_primary', primaryColGLTF, { matrix: tmpObj.matrix.clone() });
+          } else {
+            pushBox(center.x, basePartH * 0.5, center.z, TILE_SIZE * 0.96, basePartH, TILE_SIZE * 0.96, pal.side);
+          }
+        } else {
+          pushBox(center.x, basePartH * 0.5, center.z, TILE_SIZE * 0.96, basePartH, TILE_SIZE * 0.96, pal.side);
+          for (let s = 0; s < 3; s++) {
+            const stepY = basePartH + ((s + 0.5) / 3) * STEP_HEIGHT;
+            const stepSize = TILE_SIZE * (0.94 - s * 0.24);
+            pushBox(center.x, stepY, center.z, stepSize, STEP_HEIGHT / 3, stepSize, topHex, 1.0 + s * 0.03);
+          }
         }
       } else {
+        const capGLTF = this.assets?.terrain.get(tile.surface);
+        const colGLTF =
+          tile.surface === 'grass' || tile.surface === 'swamp' ? earthColGLTF : primaryColGLTF;
         const fullH = tile.height * STEP_HEIGHT;
         const capH = 0.22;
         const bodyH = Math.max(0.1, fullH - capH);
-        const isIceSurface = tile.surface === 'ice';
-        pushBox(center.x, bodyH * 0.5, center.z, TILE_SIZE * 0.95, bodyH, TILE_SIZE * 0.95, pal.side, 1.0, isIceSurface);
-        pushBox(center.x, fullH - capH * 0.5, center.z, TILE_SIZE * 0.98, capH, TILE_SIZE * 0.98, topHex, 1.04, isIceSurface);
 
-        if (tile.surface === 'grass' && !tile.prop && hash > 0.78) {
-          flowerCoords.push(center.clone());
+        if (capGLTF) {
+          const qRot =
+            tile.surface === 'cobble' || tile.surface === 'stone' || tile.surface === 'grass'
+              ? Math.floor(hash * 4) * (Math.PI / 2)
+              : 0;
+          tmpObj.position.set(center.x, center.y, center.z);
+          tmpObj.rotation.set(0, qRot, 0);
+          tmpObj.scale.set(1, 1, 1);
+          tmpObj.updateMatrix();
+
+          let tintHex: number | undefined;
+          if (tile.surface === 'cobble' && stage.biome === 'canyon') {
+            tintHex = hash > 0.5 ? 0xd99b78 : 0xc78462;
+          } else if (tile.surface === 'stone' && stage.biome === 'canyon') {
+            tintHex = hash > 0.5 ? 0xd47a55 : 0xbd6543;
+          } else if (tile.surface === 'stone' && stage.biome === 'volcanic') {
+            tintHex = 0x71717a;
+          } else if (hash > 0.5) {
+            tintHex = 0xf4f6fa;
+          }
+
+          pushTerrainBatch(tile.surface, capGLTF, { matrix: tmpObj.matrix.clone(), tintHex });
+
+          if (colGLTF) {
+            tmpObj.position.set(center.x, fullH - 0.22, center.z);
+            tmpObj.rotation.set(0, 0, 0);
+            tmpObj.scale.set(1, Math.max(0.15, bodyH + 0.14), 1);
+            tmpObj.updateMatrix();
+            const colKey =
+              tile.surface === 'grass' || tile.surface === 'swamp' ? '__col_earth' : '__col_primary';
+            pushTerrainBatch(colKey, colGLTF, { matrix: tmpObj.matrix.clone() });
+          } else {
+            pushBox(center.x, bodyH * 0.5, center.z, TILE_SIZE * 0.95, bodyH, TILE_SIZE * 0.95, pal.side);
+          }
+
+          if (tile.surface === 'grass' && !tile.prop && hash > 0.78) {
+            flowerCoords.push(center.clone());
+          }
+        } else {
+          const isIceSurface = tile.surface === 'ice';
+          pushBox(center.x, bodyH * 0.5, center.z, TILE_SIZE * 0.95, bodyH, TILE_SIZE * 0.95, pal.side, 1.0, isIceSurface);
+          pushBox(center.x, fullH - capH * 0.5, center.z, TILE_SIZE * 0.98, capH, TILE_SIZE * 0.98, topHex, 1.04, isIceSurface);
+
+          if (tile.surface === 'grass' && !tile.prop && hash > 0.78) {
+            flowerCoords.push(center.clone());
+          }
         }
       }
 
+      // Layer 1 isolates invisible hit meshes from GTAOPass normal/depth G-buffer!
       const hitMesh = new THREE.Mesh(hitGeom, hitMat);
       hitMesh.position.set(center.x, center.y + 0.02, center.z);
       hitMesh.userData = { col: tile.col, row: tile.row, height: tile.height };
+      hitMesh.layers.set(1);
       this.group.add(hitMesh);
       this.tileHitMeshes.push(hitMesh);
 
       if (tile.prop) {
-        const voxels = buildPropVoxels(tile.prop, stage.biome);
-        const propMesh = buildMergedVoxelMesh(voxels, 0.082);
-        propMesh.position.set(center.x, center.y + 0.03, center.z);
-        this.group.add(propMesh);
-        if (tile.prop === 'crystal') {
-          this.floatingCrystals.push(propMesh);
+        const propKey = resolvePropAssetKey(tile.prop, stage.biome);
+        const propGLTF = this.assets?.props.get(propKey) ?? this.assets?.props.get(tile.prop);
+
+        if (propGLTF && tile.prop !== 'crystal') {
+          const yaw =
+            tile.prop === 'tree' || tile.prop === 'pine' || tile.prop === 'rock'
+              ? hash * Math.PI * 2
+              : tile.prop === 'ruin_wall' || tile.prop === 'banner' || tile.prop === 'statue'
+                ? 0
+                : Math.floor(hash * 4) * (Math.PI / 2);
+          tmpObj.position.set(center.x, center.y, center.z);
+          tmpObj.rotation.set(0, yaw, 0);
+          tmpObj.scale.set(1, 1, 1);
+          tmpObj.updateMatrix();
+          const isTorch = tile.prop === 'torch' || tile.prop === 'brazier';
+          pushPropBatch(
+            propKey,
+            propGLTF,
+            { matrix: tmpObj.matrix.clone(), tintHex: getPropBiomeTint(tile.prop, stage.biome) },
+            isTorch
+          );
+        } else if (propGLTF && tile.prop === 'crystal') {
+          // Floating animated crystal gets its own cloned Object3D
+          const cObj = propGLTF.scene.clone(true);
+          cObj.position.set(center.x, center.y + 0.04, center.z);
+          const tint = getPropBiomeTint('crystal', stage.biome);
+          cObj.traverse((node) => {
+            if ((node as THREE.Mesh).isMesh) {
+              const m = node as THREE.Mesh;
+              m.geometry.userData.sharedGLTF = true;
+              const mat = (m.material as THREE.MeshStandardMaterial).clone();
+              if (tint && !mat.name.toLowerCase().startsWith('stone')) {
+                mat.color.setHex(tint);
+                if (mat.name.toLowerCase().startsWith('emissive')) {
+                  mat.emissive.setHex(tint);
+                }
+              }
+              this.clonedMaterialsToDispose.push(mat);
+              m.material = mat;
+              m.castShadow = !mat.name.toLowerCase().startsWith('emissive');
+              m.receiveShadow = true;
+            }
+          });
+          this.group.add(cObj);
+          this.floatingCrystals.push(cObj);
+        } else {
+          const voxels = buildPropVoxels(tile.prop, stage.biome);
+          const propMesh = buildMergedVoxelMesh(voxels, 0.082);
+          propMesh.position.set(center.x, center.y + 0.03, center.z);
+          this.group.add(propMesh);
+          if (tile.prop === 'crystal') {
+            this.floatingCrystals.push(propMesh);
+          }
         }
       }
 
       if (tile.chest) {
-        const chestMesh = buildChestMesh(tile.chest.opened);
-        chestMesh.position.set(center.x, center.y + 0.03, center.z);
-        this.group.add(chestMesh);
-        this.chestMeshes.set(tile.chest.id, chestMesh);
+        const chestGLTF = this.assets?.props.get('chest');
+        if (chestGLTF) {
+          const chestObj = chestGLTF.scene.clone(true);
+          chestObj.position.set(center.x, center.y, center.z);
+          chestObj.traverse((node) => {
+            if ((node as THREE.Mesh).isMesh) {
+              const m = node as THREE.Mesh;
+              m.geometry.userData.sharedGLTF = true;
+              m.castShadow = true;
+              m.receiveShadow = true;
+            }
+          });
+          const lid = chestObj.getObjectByName('ChestLid') ?? undefined;
+          if (lid && tile.chest.opened) {
+            lid.rotation.x = -Math.PI * 0.56;
+          }
+          this.group.add(chestObj);
+          this.chestMeshes.set(tile.chest.id, {
+            group: chestObj,
+            isGLTF: true,
+            lid,
+            opened: tile.chest.opened,
+          });
+        } else {
+          const chestMesh = buildChestMesh(tile.chest.opened);
+          chestMesh.position.set(center.x, center.y + 0.03, center.z);
+          this.group.add(chestMesh);
+          this.chestMeshes.set(tile.chest.id, {
+            group: chestMesh,
+            isGLTF: false,
+            opened: tile.chest.opened,
+          });
+        }
       }
     }
 
-    // Main stone bevel terrain geometry
-    const terrainGeom = new THREE.BufferGeometry();
-    terrainGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    terrainGeom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-    terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    terrainGeom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-    terrainGeom.setIndex(indices);
-    terrainGeom.computeBoundingSphere();
+    // Emit instanced GLB batches (massive draw call savings)
+    for (const batch of terrainBatches.values()) {
+      this.emitGLTFInstancedBatch(batch.gltf, batch.items, false);
+    }
+    for (const batch of propBatches.values()) {
+      this.emitGLTFInstancedBatch(batch.gltf, batch.items, batch.flicker);
+    }
 
-    const terrainMesh = new THREE.Mesh(terrainGeom, getVoxelPBRMaterial('stone'));
-    terrainMesh.castShadow = true;
-    terrainMesh.receiveShadow = true;
-    this.group.add(terrainMesh);
+    // Fallback/base merged geometry for subterranean crust + un-instanced tiles
+    if (indices.length > 0) {
+      const terrainGeom = new THREE.BufferGeometry();
+      terrainGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      terrainGeom.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      terrainGeom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      terrainGeom.setIndex(indices);
+      terrainGeom.computeBoundingSphere();
+      this.proceduralGeomsToDispose.push(terrainGeom);
 
-    // Physical clearcoat ice geometry (Stage 3 ice moat!)
+      const terrainMesh = new THREE.Mesh(terrainGeom, getVoxelPBRMaterial('stone'));
+      terrainMesh.castShadow = true;
+      terrainMesh.receiveShadow = true;
+      this.group.add(terrainMesh);
+    }
+
     if (iceIndices.length > 0) {
       const iceGeom = new THREE.BufferGeometry();
       iceGeom.setAttribute('position', new THREE.Float32BufferAttribute(icePositions, 3));
@@ -529,21 +862,27 @@ export class TerrainDioramaVoxel3D {
       iceGeom.setAttribute('uv', new THREE.Float32BufferAttribute(iceUvs, 2));
       iceGeom.setIndex(iceIndices);
       iceGeom.computeBoundingSphere();
+      this.proceduralGeomsToDispose.push(iceGeom);
       const iceMesh = new THREE.Mesh(iceGeom, getVoxelPBRMaterial('ice'));
       iceMesh.receiveShadow = true;
       this.group.add(iceMesh);
     }
 
-    // Instanced flowers on Stage 1 grass tiles
     if (flowerCoords.length > 0) {
       const flGeom = new THREE.BoxGeometry(0.11, 0.14, 0.11);
       const flMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7 });
+      this.proceduralGeomsToDispose.push(flGeom);
+      this.clonedMaterialsToDispose.push(flMat);
       const flMesh = new THREE.InstancedMesh(flGeom, flMat, flowerCoords.length);
       const pal = [0xfef08a, 0xf472b6, 0x38bdf8, 0xfb923c];
       const d = new THREE.Object3D();
       const col = new THREE.Color();
       flowerCoords.forEach((fc, idx) => {
-        d.position.set(fc.x + (idx % 2 === 0 ? 0.34 : -0.34), fc.y + 0.06, fc.z + (idx % 3 === 0 ? 0.25 : -0.28));
+        d.position.set(
+          fc.x + (idx % 2 === 0 ? 0.34 : -0.34),
+          fc.y + 0.06,
+          fc.z + (idx % 3 === 0 ? 0.25 : -0.28)
+        );
         d.updateMatrix();
         flMesh.setMatrixAt(idx, d.matrix);
         col.setHex(pal[idx % pal.length]);
@@ -552,7 +891,6 @@ export class TerrainDioramaVoxel3D {
       this.group.add(flMesh);
     }
 
-    // Animated Water & Lava GLSL Shader planes
     const buildLiquidPlane = (
       list: GridTile[],
       kind: 'water' | 'lava' | 'swamp_water' | 'canyon_river'
@@ -562,12 +900,20 @@ export class TerrainDioramaVoxel3D {
       this.liquidMaterials.push(mat);
       const planeGeom = new THREE.PlaneGeometry(TILE_SIZE * 0.99, TILE_SIZE * 0.99, 4, 4);
       planeGeom.rotateX(-Math.PI / 2);
-      for (const t of list) {
+      this.proceduralGeomsToDispose.push(planeGeom);
+      const im = new THREE.InstancedMesh(planeGeom, mat, list.length);
+      const d = new THREE.Object3D();
+      for (let i = 0; i < list.length; i++) {
+        const t = list[i];
         const c = tileCenterWorld(t.col, t.row, t.height, stage.cols, stage.rows);
-        const m = new THREE.Mesh(planeGeom, mat);
-        m.position.set(c.x, c.y - 0.11, c.z);
-        this.group.add(m);
+        d.position.set(c.x, c.y - 0.11, c.z);
+        d.rotation.set(0, 0, 0);
+        d.scale.set(1, 1, 1);
+        d.updateMatrix();
+        im.setMatrixAt(i, d.matrix);
       }
+      im.instanceMatrix.needsUpdate = true;
+      this.group.add(im);
     };
 
     const waterKind =
@@ -582,35 +928,33 @@ export class TerrainDioramaVoxel3D {
   }
 
   private buildBiomeArchitecture(stage: StageDef): void {
-    // Stage-unique landmark structures placed around outer perimeter / focal zones
     if (stage.biome === 'forest') {
-      // Foaming waterfall cascade dropping off left edge of Orbonne stream
       const edge = tileCenterWorld(0, 6, 1, stage.cols, stage.rows);
-      const cascade = new THREE.Mesh(
-        new THREE.PlaneGeometry(TILE_SIZE * 0.92, 2.2),
-        createLiquidShaderMaterial('canyon_river')
-      );
+      const geom = new THREE.PlaneGeometry(TILE_SIZE * 0.92, 2.2);
+      this.proceduralGeomsToDispose.push(geom);
+      const cascade = new THREE.Mesh(geom, createLiquidShaderMaterial('canyon_river'));
       this.liquidMaterials.push(cascade.material as THREE.ShaderMaterial);
       cascade.position.set(edge.x - TILE_SIZE * 0.51, edge.y - 1.1, edge.z);
       cascade.rotation.y = -Math.PI / 2;
       this.group.add(cascade);
     } else if (stage.biome === 'canyon') {
-      // Vertical roaring waterfalls off north & south river edges
+      const geom = new THREE.PlaneGeometry(TILE_SIZE * 0.96, 2.5);
+      this.proceduralGeomsToDispose.push(geom);
       for (const r of [0, stage.rows - 1]) {
         for (const c of [5, 6, 7]) {
           const edge = tileCenterWorld(c, r, 1, stage.cols, stage.rows);
-          const fall = new THREE.Mesh(
-            new THREE.PlaneGeometry(TILE_SIZE * 0.96, 2.5),
-            createLiquidShaderMaterial('canyon_river')
-          );
+          const fall = new THREE.Mesh(geom, createLiquidShaderMaterial('canyon_river'));
           this.liquidMaterials.push(fall.material as THREE.ShaderMaterial);
-          fall.position.set(edge.x, edge.y - 1.25, edge.z + (r === 0 ? -TILE_SIZE * 0.51 : TILE_SIZE * 0.51));
+          fall.position.set(
+            edge.x,
+            edge.y - 1.25,
+            edge.z + (r === 0 ? -TILE_SIZE * 0.51 : TILE_SIZE * 0.51)
+          );
           if (r === 0) fall.rotation.y = Math.PI;
           this.group.add(fall);
         }
       }
     } else if (stage.biome === 'arctic') {
-      // Iron portcullis arch over main steel gate at (6, 3)
       const gatePos = tileCenterWorld(6, 3, 4, stage.cols, stage.rows);
       const archVoxels: MicroVoxel[] = [];
       for (let x = -5; x <= 5; x++) {
@@ -629,7 +973,6 @@ export class TerrainDioramaVoxel3D {
       arch.position.copy(gatePos);
       this.group.add(arch);
     } else if (stage.biome === 'volcanic') {
-      // Colossal Gothic Throne Arch & Shattered Stained-Glass Behind Belias (row 0, col 6..7)
       const thronePos = tileCenterWorld(6, 0, 6, stage.cols, stage.rows);
       const archVb: MicroVoxel[] = [];
       for (let y = 0; y <= 24; y++) {
@@ -642,10 +985,16 @@ export class TerrainDioramaVoxel3D {
         archVb.push({ x, y: 24, z: -4, color: 0x18181b, mat: 'stone' });
         archVb.push({ x, y: 23, z: -4, color: 0xf59e0b, mat: 'gold' });
       }
-      // Glowing crimson stained-glass shards inside arch
       for (let x = -5; x <= 13; x += 3) {
         for (let y = 8; y <= 20; y += 2) {
-          archVb.push({ x, y, z: -4, color: (x + y) % 2 === 0 ? 0xf43f5e : 0xf97316, emissive: true, mat: 'emissive' });
+          archVb.push({
+            x,
+            y,
+            z: -4,
+            color: (x + y) % 2 === 0 ? 0xf43f5e : 0xf97316,
+            emissive: true,
+            mat: 'emissive',
+          });
         }
       }
       const throneArch = buildMergedVoxelMesh(archVb, 0.11);
@@ -661,6 +1010,8 @@ export class TerrainDioramaVoxel3D {
       transparent: true,
       opacity: 0.85,
     });
+    this.proceduralGeomsToDispose.push(geom);
+    this.clonedMaterialsToDispose.push(mat);
     this.ambientMesh = new THREE.InstancedMesh(geom, mat, this.maxAmbient);
     this.ambientMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.ambientMesh.frustumCulled = false;
@@ -687,11 +1038,19 @@ export class TerrainDioramaVoxel3D {
       if (stage.biome === 'arctic') {
         vel = new THREE.Vector3(1.6 + Math.random(), -1.8 - Math.random(), 0.9);
       } else if (stage.biome === 'volcanic' || stage.biome === 'canyon') {
-        vel = new THREE.Vector3((Math.random() - 0.5) * 0.6, 0.8 + Math.random() * 1.1, (Math.random() - 0.5) * 0.6);
+        vel = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.6,
+          0.8 + Math.random() * 1.1,
+          (Math.random() - 0.5) * 0.6
+        );
       } else if (stage.biome === 'forest') {
         vel = new THREE.Vector3(0.45 + Math.random() * 0.3, -0.45 - Math.random() * 0.3, 0.3);
       } else {
-        vel = new THREE.Vector3((Math.random() - 0.5) * 0.5, Math.sin(i) * 0.25, (Math.random() - 0.5) * 0.5);
+        vel = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.5,
+          Math.sin(i) * 0.25,
+          (Math.random() - 0.5) * 0.5
+        );
       }
 
       this.ambientMotes.push({
@@ -712,14 +1071,23 @@ export class TerrainDioramaVoxel3D {
   }
 
   markChestOpened(chestId: string): void {
-    const old = this.chestMeshes.get(chestId);
-    if (!old) return;
-    const pos = old.position.clone();
-    this.group.remove(old);
+    const handle = this.chestMeshes.get(chestId);
+    if (!handle || handle.opened) return;
+    handle.opened = true;
+
+    if (handle.isGLTF) {
+      if (handle.lid) {
+        handle.lid.rotation.x = -Math.PI * 0.56;
+      }
+      return;
+    }
+
+    const pos = handle.group.position.clone();
+    this.group.remove(handle.group);
     const openedMesh = buildChestMesh(true);
     openedMesh.position.copy(pos);
     this.group.add(openedMesh);
-    this.chestMeshes.set(chestId, openedMesh);
+    this.chestMeshes.set(chestId, { group: openedMesh, isGLTF: false, opened: true });
   }
 
   update(elapsed: number, dt = 0.016): void {
@@ -730,10 +1098,16 @@ export class TerrainDioramaVoxel3D {
       this.floatingCrystals[i].rotation.y = elapsed * 0.65 + i;
     }
 
+    // Subtle organic torch / brazier flicker
+    for (let i = 0; i < this.flickerEmissiveMaterials.length; i++) {
+      const m = this.flickerEmissiveMaterials[i];
+      m.emissiveIntensity = 2.3 + Math.sin(elapsed * 9.5 + i * 1.7) * 0.35 + Math.cos(elapsed * 15.2) * 0.18;
+    }
+
     if (this.ambientMesh) {
       const activeCount = Math.floor(this.maxAmbient * this.densityRatio);
-      const halfX = (this.stage.cols * TILE_SIZE) * 0.6;
-      const halfZ = (this.stage.rows * TILE_SIZE) * 0.6;
+      const halfX = this.stage.cols * TILE_SIZE * 0.6;
+      const halfZ = this.stage.rows * TILE_SIZE * 0.6;
       for (let i = 0; i < this.maxAmbient; i++) {
         if (i >= activeCount) {
           this.dummy.scale.set(0, 0, 0);
@@ -762,12 +1136,20 @@ export class TerrainDioramaVoxel3D {
   }
 
   dispose(): void {
+    for (const g of this.proceduralGeomsToDispose) {
+      g.dispose();
+    }
     this.group.traverse((obj) => {
       if ((obj as THREE.Mesh).isMesh) {
         const m = obj as THREE.Mesh;
-        m.geometry?.dispose();
+        if (m.geometry && !m.geometry.userData?.sharedGLTF) {
+          m.geometry.dispose();
+        }
       }
     });
+    for (const mat of this.clonedMaterialsToDispose) {
+      mat.dispose();
+    }
     for (const lm of this.liquidMaterials) {
       lm.dispose();
     }

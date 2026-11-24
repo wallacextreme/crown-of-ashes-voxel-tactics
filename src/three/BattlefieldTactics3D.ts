@@ -1,24 +1,29 @@
 import * as THREE from 'three';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import type { BattleUnit, Facing, SkillDef } from '../types/tactics.ts';
 import { TacticalCombatEngine, tileKey } from '../systems/TacticalCombatEngine.ts';
+import {
+  buildSyncCachedStageAssets,
+  preloadStageAssets,
+  type DioramaGLBAssets,
+} from './AssetLoader3D.ts';
+import {
+  applyBiomeLighting,
+  type BiomeVisualPreset,
+  createBiomeSkyDome,
+  disposeBiomeEnvironments,
+} from './BiomeLighting3D.ts';
 import { EffectsVoxel3D } from './EffectsVoxel3D.ts';
+import { createUnitRigHandle, type UnitRigHandle } from './GLTFCharacterRig.ts';
+import { type GraphicsPreset, PostFXPipeline3D } from './PostFXPipeline3D.ts';
 import {
   STEP_HEIGHT,
   TILE_SIZE,
   TerrainDioramaVoxel3D,
   tileCenterWorld,
 } from './TerrainDioramaVoxel3D.ts';
-import {
-  type CharacterVoxelRig,
-  type UnitAnimState,
-  animateCharacterRig,
-  createCharacterVoxelRig,
-} from './VoxelEngine3D.ts';
+import { type UnitAnimState } from './VoxelEngine3D.ts';
+
+export type { GraphicsPreset } from './PostFXPipeline3D.ts';
 
 interface PooledPointLight {
   light: THREE.PointLight;
@@ -29,19 +34,18 @@ interface PooledPointLight {
 
 interface UnitVisualState {
   id: string;
-  rig: CharacterVoxelRig;
+  rig: UnitRigHandle;
   col: number;
   row: number;
   facing: Facing;
   worldPos: THREE.Vector3;
   animState: UnitAnimState;
+  lastAppliedState: UnitAnimState;
   animTimer: number;
   animDuration: number;
   skyDiveOffsetY: number;
   isDead: boolean;
 }
-
-export type GraphicsPreset = 'LOW' | 'MEDIUM' | 'HIGH';
 
 export function isMobileOrCoarseDevice(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
@@ -77,29 +81,84 @@ function facingToYaw(facing: Facing): number {
   }
 }
 
+function createTacticalOverlayMaterial(
+  colorHex: number,
+  baseOpacity: number,
+  striped = false
+): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(colorHex) },
+      uOpacity: { value: baseOpacity },
+      uTime: { value: 0 },
+      uStriped: { value: striped ? 1.0 : 0.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      uniform float uTime;
+      uniform float uStriped;
+      varying vec2 vUv;
+
+      void main() {
+        vec2 edge = min(vUv, 1.0 - vUv);
+        float minEdge = min(edge.x, edge.y);
+        float border = 1.0 - smoothstep(0.035, 0.095, minEdge);
+        float pulse = 0.85 + 0.15 * sin(uTime * 4.5);
+
+        float pattern = 1.0;
+        if (uStriped > 0.5) {
+          float diag = fract((vUv.x + vUv.y) * 5.0 - uTime * 0.8);
+          pattern = mix(0.55, 1.15, smoothstep(0.35, 0.55, diag) - smoothstep(0.75, 0.95, diag));
+        }
+
+        float fillAlpha = uOpacity * 0.42 * pattern;
+        float borderAlpha = min(1.0, uOpacity * 1.45) * pulse;
+        float alpha = mix(fillAlpha, borderAlpha, border);
+        vec3 col = mix(uColor, uColor * 1.45 + vec3(0.12), border);
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
 export class BattlefieldTactics3D {
   canvas: HTMLCanvasElement;
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
-  composer: EffectComposer;
-  bloomPass: UnrealBloomPass;
+  postFX: PostFXPipeline3D;
   timer: THREE.Timer;
 
   private hemiLight: THREE.HemisphereLight;
   private sunLight: THREE.DirectionalLight;
+  private rimLight: THREE.DirectionalLight;
+  private skyDome: THREE.Mesh;
   private pointLightPool: PooledPointLight[] = [];
   private diorama: TerrainDioramaVoxel3D | null = null;
   private effects: EffectsVoxel3D;
   private engine: TacticalCombatEngine | null = null;
   private unitVisuals = new Map<string, UnitVisualState>();
   private currentPreset: GraphicsPreset = 'HIGH';
-  private baseSkyColor = 0x0c1322;
-  private baseSunIntensity = 1.35;
-  private baseHemiIntensity = 0.45;
+  private currentBiomePreset!: BiomeVisualPreset;
+  private baseSkyColor = 0x132036;
+  private baseSunIntensity = 2.35;
+  private baseHemiIntensity = 0.62;
   private envPulseTimer = 0;
   private envPulseMode: 'storm_dark' | 'blood_sky' | null = null;
   private hitStopTimer = 0;
+  private stageLoadToken = 0;
+  private stageReadyPromise: Promise<void> = Promise.resolve();
 
   // Tactical overlays
   private overlayGroup = new THREE.Group();
@@ -153,15 +212,14 @@ export class BattlefieldTactics3D {
   private callbacks: BattlefieldCallbacks;
   private elapsed = 0;
   private timeScale = 1;
-  private activeSkillHighlightColor = 0x38bdf8;
   private disposed = false;
 
   // Shared tile overlay materials & geometry
-  private tileOverlayGeom = new THREE.PlaneGeometry(TILE_SIZE * 0.86, TILE_SIZE * 0.86);
-  private moveMat: THREE.MeshBasicMaterial;
-  private attackMat: THREE.MeshBasicMaterial;
-  private aoeMat: THREE.MeshBasicMaterial;
-  private telegraphMat: THREE.MeshBasicMaterial;
+  private tileOverlayGeom = new THREE.PlaneGeometry(TILE_SIZE * 0.88, TILE_SIZE * 0.88);
+  private moveMat: THREE.ShaderMaterial;
+  private attackMat: THREE.ShaderMaterial;
+  private aoeMat: THREE.ShaderMaterial;
+  private telegraphMat: THREE.ShaderMaterial;
 
   constructor(canvas: HTMLCanvasElement, callbacks: BattlefieldCallbacks) {
     this.canvas = canvas;
@@ -174,40 +232,36 @@ export class BattlefieldTactics3D {
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.0));
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.94;
+    this.renderer.toneMappingExposure = 1.0;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
 
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0c1322);
-    this.scene.fog = new THREE.FogExp2(0x0c1322, 0.016);
+    this.scene.background = new THREE.Color(0x132036);
+    this.scene.fog = new THREE.FogExp2(0x1a2d42, 0.013);
 
     this.camera = new THREE.PerspectiveCamera(
-      40,
+      36,
       window.innerWidth / Math.max(1, window.innerHeight),
       0.2,
       140
     );
 
-    // PBR IBL via PMREMGenerator + RoomEnvironment
-    const pmrem = new THREE.PMREMGenerator(this.renderer);
-    const room = new RoomEnvironment();
-    this.scene.environment = pmrem.fromScene(room, 0.04).texture;
-    this.scene.environmentIntensity = 0.85;
-    room.dispose();
-    pmrem.dispose();
+    this.skyDome = createBiomeSkyDome();
+    this.scene.add(this.skyDome);
 
-    // Global key directional light with optimized 2048x2048 shadow frustum + hemisphere fill
-    this.hemiLight = new THREE.HemisphereLight(0xbbe6ff, 0x33271e, 0.42);
+    // 3-Point Diorama Lighting (Hemisphere + Shadow Key Sun + Opposite Rim Light)
+    this.hemiLight = new THREE.HemisphereLight(0xbae6fd, 0x423222, 0.62);
     this.scene.add(this.hemiLight);
 
-    this.sunLight = new THREE.DirectionalLight(0xfff1d6, 1.35);
-    this.sunLight.position.set(14, 24, 12);
+    this.sunLight = new THREE.DirectionalLight(0xffe6ba, 2.35);
+    this.sunLight.position.set(14, 24, 13);
     this.sunLight.castShadow = true;
     this.sunLight.shadow.mapSize.set(2048, 2048);
     this.sunLight.shadow.bias = -0.0004;
-    this.sunLight.shadow.normalBias = 0.015;
+    this.sunLight.shadow.normalBias = 0.018;
     const sc = this.sunLight.shadow.camera;
     sc.near = 2;
     sc.far = 65;
@@ -218,7 +272,12 @@ export class BattlefieldTactics3D {
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
-    // ANTI-FREEZE RULE: Pre-allocate fixed pool of 3 PointLights once at boot (intensity = 0)
+    this.rimLight = new THREE.DirectionalLight(0x7dd3fc, 0.72);
+    this.rimLight.position.set(-15, 11, -14);
+    this.rimLight.castShadow = false;
+    this.scene.add(this.rimLight);
+
+    // Pre-allocate fixed pool of 3 PointLights once at boot (intensity = 0)
     for (let i = 0; i < 3; i++) {
       const pl = new THREE.PointLight(0xffffff, 0, 11, 1.5);
       pl.castShadow = false;
@@ -226,44 +285,29 @@ export class BattlefieldTactics3D {
       this.pointLightPool.push({ light: pl, life: 0, maxLife: 0, peakIntensity: 0 });
     }
 
-    // Post-processing pipeline: RenderPass -> UnrealBloomPass -> OutputPass
-    this.composer = new EffectComposer(this.renderer);
-    this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(window.innerWidth, window.innerHeight),
-      0.45,
-      0.32,
-      1.02
+    // Post-processing pipeline: RenderPass -> GTAOPass (HIGH) -> UnrealBloomPass -> TiltShiftGrade -> OutputPass
+    this.postFX = new PostFXPipeline3D(
+      this.renderer,
+      this.scene,
+      this.camera,
+      window.innerWidth,
+      window.innerHeight
     );
-    this.composer.addPass(this.bloomPass);
-    this.composer.addPass(new OutputPass());
+
+    this.currentBiomePreset = applyBiomeLighting(
+      this.scene,
+      this.renderer,
+      { sunLight: this.sunLight, rimLight: this.rimLight, hemiLight: this.hemiLight, skyDome: this.skyDome },
+      'forest'
+    );
+    this.postFX.applyBiomeTuning(this.currentBiomePreset);
 
     // Tactical tile highlight materials
     this.tileOverlayGeom.rotateX(-Math.PI / 2);
-    this.moveMat = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
-      transparent: true,
-      opacity: 0.45,
-      depthWrite: false,
-    });
-    this.attackMat = new THREE.MeshBasicMaterial({
-      color: 0xf43f5e,
-      transparent: true,
-      opacity: 0.48,
-      depthWrite: false,
-    });
-    this.aoeMat = new THREE.MeshBasicMaterial({
-      color: 0xfacc15,
-      transparent: true,
-      opacity: 0.62,
-      depthWrite: false,
-    });
-    this.telegraphMat = new THREE.MeshBasicMaterial({
-      color: 0xff4500,
-      transparent: true,
-      opacity: 0.65,
-      depthWrite: false,
-    });
+    this.moveMat = createTacticalOverlayMaterial(0x38bdf8, 0.62, false);
+    this.attackMat = createTacticalOverlayMaterial(0xf43f5e, 0.68, false);
+    this.aoeMat = createTacticalOverlayMaterial(0xfacc15, 0.76, false);
+    this.telegraphMat = createTacticalOverlayMaterial(0xff5500, 0.80, true);
 
     this.scene.add(this.overlayGroup);
 
@@ -274,7 +318,7 @@ export class BattlefieldTactics3D {
         color: 0xffffff,
         side: THREE.DoubleSide,
         transparent: true,
-        opacity: 0.9,
+        opacity: 0.92,
         depthWrite: false,
       })
     );
@@ -310,18 +354,54 @@ export class BattlefieldTactics3D {
     );
     this.scene.add(this.effects.group);
 
-    // Expose renderer & scene on window for diagnostics/verification
-    Object.assign(window, { renderer: this.renderer, scene: this.scene });
+    // Expose diagnostics & runtime debug controls
+    Object.assign(window, {
+      renderer: this.renderer,
+      scene: this.scene,
+      __coaDebug: {
+        setPreset: (p: GraphicsPreset) => this.setGraphicsPreset(p),
+        whenReady: () => this.whenAssetsReady(),
+        getStats: () => this.getDebugStats(),
+      },
+    });
 
     this.timer = new THREE.Timer();
     this.timer.connect(document);
 
     if (isMobileOrCoarseDevice()) {
       this.setGraphicsPreset('MEDIUM');
+    } else {
+      this.setGraphicsPreset('HIGH');
     }
 
     this.bindEvents();
     this.startLoop();
+  }
+
+  getDebugStats() {
+    const units = Array.from(this.unitVisuals.values()).map((uv) => ({
+      id: uv.id,
+      isGLTF: uv.rig.isGLTF,
+      animState: uv.animState,
+      posY: Number(uv.rig.root.position.y.toFixed(3)),
+      rotY: Number(uv.rig.root.rotation.y.toFixed(3)),
+    }));
+    return {
+      stageId: this.engine?.stage.id ?? null,
+      biome: this.engine?.stage.biome ?? null,
+      preset: this.currentPreset,
+      drawCalls: this.postFX.lastDrawCalls,
+      triangles: this.postFX.lastTriangles,
+      geometries: this.renderer.info.memory.geometries,
+      textures: this.renderer.info.memory.textures,
+      gltfUnits: units.filter((u) => u.isGLTF).length,
+      totalUnits: units.length,
+      units,
+    };
+  }
+
+  whenAssetsReady(): Promise<void> {
+    return this.stageReadyPromise;
   }
 
   private buildFacingCompass(): void {
@@ -335,7 +415,6 @@ export class BattlefieldTactics3D {
     const arrowShape = new THREE.ConeGeometry(0.3, 0.56, 4);
     arrowShape.rotateX(Math.PI / 2);
 
-    // Enlarged invisible touch hit sphere for reliable mobile tapping without neighbor overlap
     const hitGeom = new THREE.SphereGeometry(0.68, 12, 10);
     const hitMat = new THREE.MeshBasicMaterial({
       transparent: true,
@@ -359,6 +438,7 @@ export class BattlefieldTactics3D {
       const hitMesh = new THREE.Mesh(hitGeom, hitMat);
       hitMesh.position.set(d.offset[0], 0.42, d.offset[1]);
       hitMesh.userData = { compassFacing: d.facing };
+      hitMesh.layers.set(1); // Keep invisible hit spheres out of GTAOPass
 
       this.compassGroup.add(mesh);
       this.compassGroup.add(hitMesh);
@@ -373,10 +453,11 @@ export class BattlefieldTactics3D {
     intensity: number,
     duration: number
   ): void {
-    // Reuse idle slot or oldest slot — NEVER add/remove PointLights dynamically
     let slot = this.pointLightPool.find((p) => p.life >= p.maxLife || p.light.intensity <= 0.01);
     if (!slot) {
-      slot = this.pointLightPool.reduce((a, b) => (a.life / Math.max(0.01, a.maxLife) > b.life / Math.max(0.01, b.maxLife) ? a : b));
+      slot = this.pointLightPool.reduce((a, b) =>
+        a.life / Math.max(0.01, a.maxLife) > b.life / Math.max(0.01, b.maxLife) ? a : b
+      );
     }
     slot.light.position.copy(pos);
     slot.light.color.setHex(colorHex);
@@ -394,56 +475,61 @@ export class BattlefieldTactics3D {
     return tile ? tile.height * STEP_HEIGHT : 0;
   }
 
-  loadStage(engine: TacticalCombatEngine): void {
-    this.engine = engine;
-    this.clearHighlights();
-    this.showFacingCompass(null);
-    this.setParabolicArc(null, null);
-
-    // Dispose old diorama
+  private rebuildDioramaWithAssets(engine: TacticalCombatEngine, assets: DioramaGLBAssets): void {
     if (this.diorama) {
       this.scene.remove(this.diorama.group);
       this.diorama.dispose();
       this.diorama = null;
     }
+    this.diorama = new TerrainDioramaVoxel3D(engine.stage, engine.tiles, assets);
+    this.diorama.setParticleDensity(
+      this.currentPreset === 'LOW' ? 0.4 : this.currentPreset === 'MEDIUM' ? 0.75 : 1.0
+    );
+    this.scene.add(this.diorama.group);
+    for (const tile of engine.tiles.values()) {
+      if (tile.chest?.opened) {
+        this.diorama.markChestOpened(tile.chest.id);
+      }
+    }
+  }
 
-    // Remove old unit rigs
+  loadStage(engine: TacticalCombatEngine): void {
+    const token = ++this.stageLoadToken;
+    this.engine = engine;
+    this.clearHighlights();
+    this.showFacingCompass(null);
+    this.setParabolicArc(null, null);
+
+    // Apply rich per-biome PBR lighting, PMREM environment & PostFX grading
+    this.currentBiomePreset = applyBiomeLighting(
+      this.scene,
+      this.renderer,
+      { sunLight: this.sunLight, rimLight: this.rimLight, hemiLight: this.hemiLight, skyDome: this.skyDome },
+      engine.stage.biome
+    );
+    this.baseSkyColor = this.currentBiomePreset.skyColor;
+    this.baseSunIntensity = this.currentBiomePreset.sunIntensity;
+    this.baseHemiIntensity = this.currentBiomePreset.hemiIntensity;
+    this.postFX.applyBiomeTuning(this.currentBiomePreset);
+
+    // Clear old unit rigs
     for (const uv of this.unitVisuals.values()) {
       this.scene.remove(uv.rig.root);
+      uv.rig.dispose();
     }
     this.unitVisuals.clear();
 
-    // Update per-biome sky, fog & dramatic lighting mood
-    const biomeMoods: Record<
-      string,
-      { sky: number; sunColor: number; sunInt: number; hemiSky: number; hemiGround: number; hemiInt: number }
-    > = {
-      forest: { sky: 0x162238, sunColor: 0xffe4b8, sunInt: 1.45, hemiSky: 0xbae6fd, hemiGround: 0x3b2d1f, hemiInt: 0.44 },
-      canyon: { sky: 0x22172a, sunColor: 0xffedd5, sunInt: 1.40, hemiSky: 0xfde68a, hemiGround: 0x451a03, hemiInt: 0.42 },
-      arctic: { sky: 0x0e1d36, sunColor: 0xdbeafe, sunInt: 1.25, hemiSky: 0x93c5fd, hemiGround: 0x1e293b, hemiInt: 0.46 },
-      swamp: { sky: 0x0b1917, sunColor: 0xa7f3d0, sunInt: 1.05, hemiSky: 0x6ee7b7, hemiGround: 0x1c1917, hemiInt: 0.40 },
-      volcanic: { sky: 0x210b0d, sunColor: 0xffb38a, sunInt: 1.35, hemiSky: 0xfca5a5, hemiGround: 0x271313, hemiInt: 0.42 },
-    };
-    const mood = biomeMoods[engine.stage.biome] ?? biomeMoods.forest;
-    this.baseSkyColor = mood.sky;
-    this.baseSunIntensity = mood.sunInt;
-    this.baseHemiIntensity = mood.hemiInt;
-    this.scene.background = new THREE.Color(mood.sky);
-    (this.scene.fog as THREE.FogExp2).color.setHex(mood.sky);
-    this.sunLight.color.setHex(mood.sunColor);
-    this.sunLight.intensity = mood.sunInt;
-    this.hemiLight.color.setHex(mood.hemiSky);
-    this.hemiLight.groundColor.setHex(mood.hemiGround);
-    this.hemiLight.intensity = mood.hemiInt;
+    const jobIds = engine.units.map((u) => u.jobId);
+    const syncAssets = buildSyncCachedStageAssets(engine.stage, jobIds);
 
-    // Build diorama
-    this.diorama = new TerrainDioramaVoxel3D(engine.stage, engine.tiles);
-    this.diorama.setParticleDensity(this.currentPreset === 'LOW' ? 0.4 : this.currentPreset === 'MEDIUM' ? 0.75 : 1.0);
-    this.scene.add(this.diorama.group);
+    // Build diorama synchronously with cached GLBs or instant procedural fallback
+    this.rebuildDioramaWithAssets(engine, syncAssets);
 
-    // Spawn voxel rigs for all units
+    // Spawn rigs for all units
     for (const u of engine.units) {
-      const rig = createCharacterVoxelRig(u.jobId, u.team, Boolean(u.isBoss));
+      const initialState: UnitAnimState = u.hp > 0 ? 'idle' : 'dead';
+      const gltf = syncAssets.characters.get(u.jobId) ?? null;
+      const rig = createUnitRigHandle(gltf, u.jobId, u.team, Boolean(u.isBoss), initialState);
       const worldPos = this.getUnitAnchorWorldPos(u);
       rig.root.position.copy(worldPos);
       rig.root.rotation.y = facingToYaw(u.facing);
@@ -456,7 +542,8 @@ export class BattlefieldTactics3D {
         row: u.row,
         facing: u.facing,
         worldPos: worldPos.clone(),
-        animState: u.hp > 0 ? 'idle' : 'dead',
+        animState: initialState,
+        lastAppliedState: initialState,
         animTimer: 0,
         animDuration: 0,
         skyDiveOffsetY: 0,
@@ -464,9 +551,39 @@ export class BattlefieldTactics3D {
       });
     }
 
-    this.targetFocus.set(0, 1.4, 0);
+    // Async preload GLB models and seamlessly upgrade diorama & unit rigs
+    this.stageReadyPromise = preloadStageAssets(engine.stage, jobIds).then((loaded) => {
+      if (this.disposed || token !== this.stageLoadToken || this.engine !== engine) return;
+
+      if (loaded.terrain.size > syncAssets.terrain.size || loaded.props.size > syncAssets.props.size) {
+        this.rebuildDioramaWithAssets(engine, loaded);
+      }
+
+      for (const u of engine.units) {
+        const uv = this.unitVisuals.get(u.id);
+        const gltf = loaded.characters.get(u.jobId);
+        if (!uv || !gltf || uv.rig.isGLTF) continue;
+
+        const oldPos = uv.rig.root.position.clone();
+        const oldRotY = uv.rig.root.rotation.y;
+        const isAct = engine.activeUnitId === u.id && u.hp > 0;
+        const nextRig = createUnitRigHandle(gltf, u.jobId, u.team, Boolean(u.isBoss), uv.animState);
+        nextRig.root.position.copy(oldPos);
+        nextRig.root.rotation.y = oldRotY;
+        nextRig.setActiveHighlight(isAct);
+
+        this.scene.remove(uv.rig.root);
+        uv.rig.dispose();
+        uv.rig = nextRig;
+        uv.lastAppliedState = uv.animState;
+        this.scene.add(nextRig.root);
+      }
+    });
+
+    this.targetFocus.set(0, 1.35, 0);
     this.focusPoint.copy(this.targetFocus);
-    this.targetDistance = engine.stage.cols >= 14 ? 21.5 : 18.5;
+    this.targetDistance = engine.stage.cols >= 14 ? 24.5 : 21.5;
+    this.distance = this.targetDistance;
   }
 
   private getUnitAnchorWorldPos(u: BattleUnit): THREE.Vector3 {
@@ -496,19 +613,16 @@ export class BattlefieldTactics3D {
       } else if (uv.animState === 'dead') {
         uv.animState = 'idle';
       }
-      // Highlight active unit ring
       const isAct = engine.activeUnitId === u.id && u.hp > 0;
-      uv.rig.teamRing.scale.setScalar(isAct ? 1.24 : 1.0);
+      uv.rig.setActiveHighlight(isAct);
     }
 
-    // Sync chest visuals
     for (const tile of engine.tiles.values()) {
       if (tile.chest?.opened && this.diorama) {
         this.diorama.markChestOpened(tile.chest.id);
       }
     }
 
-    // Sync Belias telegraphed meteor + burning tiles
     this.refreshPersistentTileEffects(engine);
   }
 
@@ -565,7 +679,7 @@ export class BattlefieldTactics3D {
   private setTileListHighlight(
     list: { col: number; row: number }[],
     targetArray: THREE.Mesh[],
-    mat: THREE.MeshBasicMaterial,
+    mat: THREE.Material,
     yOffset: number
   ): void {
     for (const m of targetArray) {
@@ -677,24 +791,21 @@ export class BattlefieldTactics3D {
     if (preset === 'LOW') {
       targetRatio = 1.0;
       shadowDim = 1024;
-      this.bloomPass.enabled = false;
       density = 0.4;
     } else if (preset === 'MEDIUM') {
       targetRatio = mobile ? Math.min(dpr, 1.35) : Math.min(dpr, 1.5);
       shadowDim = mobile ? 1024 : 2048;
-      this.bloomPass.enabled = true;
       density = 0.75;
     } else {
       targetRatio = Math.min(dpr, 2.0);
-      shadowDim = 2048;
-      this.bloomPass.enabled = true;
+      shadowDim = mobile ? 2048 : 4096;
       density = 1.0;
     }
 
     this.renderer.setPixelRatio(targetRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
-    this.composer.setSize(window.innerWidth, window.innerHeight);
-    this.bloomPass.resolution.set(window.innerWidth, window.innerHeight);
+    this.postFX.setPreset(preset);
+    this.postFX.setSize(window.innerWidth, window.innerHeight);
 
     if (this.sunLight.shadow.mapSize.x !== shadowDim) {
       this.sunLight.shadow.mapSize.set(shadowDim, shadowDim);
@@ -825,9 +936,8 @@ export class BattlefieldTactics3D {
           uv.facing = Math.abs(dc) >= Math.abs(dr) ? (dc > 0 ? 'E' : 'W') : dr > 0 ? 'S' : 'N';
         }
 
-        // Special Dragoon Sky Dive animation: 120ms crouch anticipation -> supersonic vertical launch + wind rings -> diagonal dive!
         if (skill.vfxType === 'sky_dive') {
-          uv.rig.bodyPivot.scale.set(1.16, 0.80, 1.16);
+          uv.rig.bodyPivot.scale.set(1.16, 0.8, 1.16);
           await new Promise((r) => setTimeout(r, 120 / this.timeScale));
           this.effects.spawnSkyDiveWindRings(attackerPos);
 
@@ -880,6 +990,8 @@ export class BattlefieldTactics3D {
                   : 'slash';
           uv.animTimer = 0;
           uv.animDuration = 0.48;
+          uv.rig.setState(uv.animState, true);
+          uv.lastAppliedState = uv.animState;
           await new Promise((r) => setTimeout(r, 220 / this.timeScale));
         }
       }
@@ -891,7 +1003,7 @@ export class BattlefieldTactics3D {
         console.error('[BattlefieldTactics3D] VFX error during skill animation:', err);
       }
       if (skill.vfxType === 'apocalypse_meteor') {
-        this.hitStopTimer = 0.09; // 90ms dramatic impact hit-stop
+        this.hitStopTimer = 0.09;
       }
       this.addTrauma(skill.aoeRadius > 0 || skill.vfxType === 'sky_dive' ? 0.55 : 0.25);
 
@@ -919,18 +1031,29 @@ export class BattlefieldTactics3D {
     if (killed) {
       uv.isDead = true;
       uv.animState = 'dead';
+      uv.lastAppliedState = 'dead';
+      uv.rig.setState('dead', true);
+      uv.rig.triggerFlash(0xf43f5e, 0.24);
       this.effects.spawnVoxelBurst(uv.worldPos, 28, [0x94a3b8, 0xf43f5e, 0xfef08a], 5.2, 6.0, 1.2);
       this.addTrauma(0.6);
       return;
     }
     uv.animState = isBlocked ? 'block' : 'hit';
+    uv.lastAppliedState = uv.animState;
+    uv.rig.setState(uv.animState, true);
     uv.animTimer = 0;
     uv.animDuration = 0.35;
+
     if (isCrit) {
+      uv.rig.triggerFlash(0xfef08a, 0.22);
+      this.hitStopTimer = Math.max(this.hitStopTimer, 0.055);
       this.effects.spawnVoxelBurst(uv.worldPos, 22, [0xfacc15, 0xf97316, 0xffffff], 5.0, 5.5, 1.15);
       this.addTrauma(0.75);
     } else if (isBlocked) {
+      uv.rig.triggerFlash(0x60a5fa, 0.16);
       this.effects.spawnVoxelBurst(uv.worldPos, 8, [0x60a5fa, 0xffffff], 2.8, 3.0, 0.85);
+    } else {
+      uv.rig.triggerFlash(0xffffff, 0.15);
     }
   }
 
@@ -958,8 +1081,7 @@ export class BattlefieldTactics3D {
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(w, h, false);
-      this.composer.setSize(w, h);
-      this.bloomPass.resolution.set(w, h);
+      this.postFX.setSize(w, h);
     };
     window.addEventListener('resize', onResize);
 
@@ -1090,7 +1212,6 @@ export class BattlefieldTactics3D {
       this.hasDragged = false;
     });
 
-    // Multi-touch Pinch-to-Zoom + 2-Finger Pan
     this.canvas.addEventListener(
       'touchstart',
       (e) => {
@@ -1165,8 +1286,8 @@ export class BattlefieldTactics3D {
 
   private updateRaycastHover(): void {
     this.raycaster.setFromCamera(this.pointer, this.camera);
+    this.raycaster.layers.set(1);
 
-    // Check facing compass first when visible (uses enlarged hit spheres)
     if (this.compassGroup.visible) {
       const compassHits = this.raycaster.intersectObjects(
         this.compassArrows.map((a) => a.hitMesh),
@@ -1182,6 +1303,7 @@ export class BattlefieldTactics3D {
           a.mat.emissiveIntensity = a.facing === f ? 3.2 : 1.5;
           a.mesh.scale.setScalar(a.facing === f ? 1.38 : 1.0);
         }
+        this.raycaster.layers.set(0);
         return;
       } else if (this.hoveredCompass !== null) {
         this.hoveredCompass = null;
@@ -1193,8 +1315,13 @@ export class BattlefieldTactics3D {
       }
     }
 
-    if (!this.diorama || !this.engine) return;
+    if (!this.diorama || !this.engine) {
+      this.raycaster.layers.set(0);
+      return;
+    }
     const hits = this.raycaster.intersectObjects(this.diorama.tileHitMeshes, false);
+    this.raycaster.layers.set(0);
+
     if (hits.length > 0) {
       const ud = hits[0].object.userData as { col: number; row: number; height: number };
       const wp = tileCenterWorld(ud.col, ud.row, ud.height, this.engine.stage.cols, this.engine.stage.rows);
@@ -1247,7 +1374,7 @@ export class BattlefieldTactics3D {
           this.sunLight.intensity = this.baseSunIntensity;
           this.hemiLight.intensity = this.baseHemiIntensity;
           (this.scene.background as THREE.Color).setHex(this.baseSkyColor);
-          (this.scene.fog as THREE.FogExp2).color.setHex(this.baseSkyColor);
+          (this.scene.fog as THREE.FogExp2).color.setHex(this.currentBiomePreset.fogColor);
         }
       }
 
@@ -1291,8 +1418,10 @@ export class BattlefieldTactics3D {
 
       // Pulse overlay materials
       const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 4.5);
-      this.aoeMat.opacity = 0.42 + pulse * 0.32;
-      this.telegraphMat.opacity = 0.45 + pulse * 0.38;
+      this.moveMat.uniforms.uTime.value = this.elapsed;
+      this.attackMat.uniforms.uTime.value = this.elapsed;
+      this.aoeMat.uniforms.uTime.value = this.elapsed;
+      this.telegraphMat.uniforms.uTime.value = this.elapsed;
       this.cursorMesh.scale.setScalar(0.96 + pulse * 0.08);
       if (this.compassGroup.visible) {
         this.compassGroup.position.y = this.compassBaseY + Math.sin(this.elapsed * 5) * 0.04;
@@ -1329,8 +1458,12 @@ export class BattlefieldTactics3D {
             uv.animDuration = 0;
           }
         }
+        if (uv.lastAppliedState !== uv.animState) {
+          uv.rig.setState(uv.animState);
+          uv.lastAppliedState = uv.animState;
+        }
         const phase = uv.animDuration > 0 ? uv.animTimer / uv.animDuration : 0;
-        animateCharacterRig(uv.rig, uv.animState, this.elapsed, phase);
+        uv.rig.update(dt, this.elapsed, phase);
       }
 
       // Emit 2D screen projections for diegetic unit HP bars
@@ -1343,7 +1476,7 @@ export class BattlefieldTactics3D {
         this.callbacks.onUnitProjections(list);
       }
 
-      this.composer.render();
+      this.postFX.render();
     });
   }
 
@@ -1352,6 +1485,17 @@ export class BattlefieldTactics3D {
     this.renderer.setAnimationLoop(null);
     this.timer.dispose();
     this.diorama?.dispose();
+    for (const uv of this.unitVisuals.values()) {
+      uv.rig.dispose();
+    }
+    this.unitVisuals.clear();
+    this.postFX.dispose();
+    disposeBiomeEnvironments();
+    this.moveMat.dispose();
+    this.attackMat.dispose();
+    this.aoeMat.dispose();
+    this.telegraphMat.dispose();
+    this.tileOverlayGeom.dispose();
     this.renderer.dispose();
   }
 }
