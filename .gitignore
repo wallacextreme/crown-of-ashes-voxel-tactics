@@ -3,3 +3,6 @@ dist/
 .DS_Store
 *.log
 .vite/
+art_pipeline/renders_qa/
+__pycache__/
+*.pyc
