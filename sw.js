@@ -1,4 +1,4 @@
-const CACHE_NAME = 'crown-of-ashes-pwa-v2';
+const CACHE_NAME = 'crown-of-ashes-pwa-v3';
 const PRECACHE_URLS = [
   './',
   './index.html',
@@ -6,6 +6,9 @@ const PRECACHE_URLS = [
   './icon.svg',
   './icon-192.png',
   './icon-512.png',
+  './draco/draco_wasm_wrapper.js',
+  './draco/draco_decoder.wasm',
+  './draco/draco_decoder.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -30,6 +33,22 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+
+  // Cache-first for immutable binary GLB models and versioned Draco decoders
+  if (url.pathname.includes('/assets/models/') || url.pathname.includes('/draco/')) {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        const cached = await cache.match(request);
+        if (cached) return cached;
+        const response = await fetch(request);
+        if (response && response.ok) {
+          cache.put(request, response.clone());
+        }
+        return response;
+      })
+    );
+    return;
+  }
 
   event.respondWith(
     fetch(request)
